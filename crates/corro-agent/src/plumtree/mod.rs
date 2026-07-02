@@ -308,7 +308,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     tripwire: Tripwire,
 ) {
     let config = plum_foca::Config {
-        ihave_timeout: Duration::from_millis(200),
+        ihave_timeout: Duration::from_millis(100),
         optimization_threshold: Some(7),
         max_cached_payloads: 5000,
         num_eager: None,
@@ -366,7 +366,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     ));
 
     // send out ihave digests to lazy peers
-    let mut ihave_tick_interval = interval(Duration::from_millis(200));
+    let mut ihave_tick_interval = interval(Duration::from_millis(150));
     let mut maintenance_interval = interval(Duration::from_secs(60));
 
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
@@ -583,23 +583,23 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
                     Err(()) => continue,
                 };
 
-                if p1_gossip {
-                    // gossip is sent to latest eager peers
-                    p1_gossip_batch.peers = peers;
-                    p1_gossip_batch.buf.extend_from_slice(&payload);
-                    if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
-                        p1_queue.push_back(PendingPlumtreeSend {
-                            peers: std::mem::take(&mut p1_gossip_batch.peers),
-                            payload: p1_gossip_batch.buf.split().freeze(),
-                        });
-                    }
-                } else {
-                    let pending = PendingPlumtreeSend { peers, payload };
-                    match prio {
-                        PlumPrio::P0 => p0_queue.push_back(pending),
-                        PlumPrio::P1 => p1_queue.push_back(pending),
-                    }
+                // if p1_gossip {
+                //     // gossip is sent to latest eager peers
+                //     p1_gossip_batch.peers = peers;
+                //     p1_gossip_batch.buf.extend_from_slice(&payload);
+                //     if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
+                //         p1_queue.push_back(PendingPlumtreeSend {
+                //             peers: std::mem::take(&mut p1_gossip_batch.peers),
+                //             payload: p1_gossip_batch.buf.split().freeze(),
+                //         });
+                //     }
+                // } else {
+                let pending = PendingPlumtreeSend { peers, payload };
+                match prio {
+                    PlumPrio::P0 => p0_queue.push_back(pending),
+                    PlumPrio::P1 => p1_queue.push_back(pending),
                 }
+                // }
             }
         }
 

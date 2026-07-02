@@ -200,29 +200,61 @@ impl Members {
     /// `RING_BUCKETS`.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
-            if let Some(avg) = self.rtts.get(&addr).and_then(|rtt| {
-                // If the ring buffer isn't empty
-                (!rtt.buf.is_empty()).then(|| {
-                    // We can only access the ring buffer via two
-                    // slices, so we sum both of them together
-                    (rtt.buf.as_slices().0.iter().sum::<u64>()
-                     + rtt.buf.as_slices().1.iter().sum::<u64>())
-                        // Then average over the full size of the ring
-                        // buffer for the average of recent RTTs
-                        / rtt.buf.len() as u64
-                })
-            }) {
-                if let Some(state) = self.states.get_mut(actor_id) {
-                    // We check which range-bucket the RTT is
-                    // contained in, then update the stored index
-                    for (ring, n) in RING_BUCKETS.iter().enumerate() {
-                        if n.contains(&avg) {
-                            state.ring = Some(ring as u8);
-                            break;
+            if let Some(rtt) = self.rtts.get(&addr) {
+                let avg = {
+                    (!rtt.buf.is_empty()).then(|| {
+                        // We can only access the ring buffer via two
+                        // slices, so we sum both of them together
+                        (rtt.buf.as_slices().0.iter().sum::<u64>()
+                         + rtt.buf.as_slices().1.iter().sum::<u64>())
+                            // Then average over the full size of the ring
+                            // buffer for the average of recent RTTs
+                            / rtt.buf.len() as u64
+                    })
+                };
+
+                if let Some(avg) = avg {
+                    if let Some(state) = self.states.get_mut(actor_id) {
+                        for (ring, n) in RING_BUCKETS.iter().enumerate() {
+                            if n.contains(&avg) {
+                                if state.ring != Some(ring as u8) {
+                                    info!(
+                                        "rtt slice 1: {:?}, rtt slice 1: {:?}",
+                                        rtt.buf.as_slices().0,
+                                        rtt.buf.as_slices().1
+                                    );
+                                }
+                                state.ring = Some(ring as u8);
+                                break;
+                            }
                         }
                     }
                 }
             }
+
+            // if let Some(avg) = self.rtts.get(&addr).and_then(|rtt| {
+            //     // If the ring buffer isn't empty
+            //     (!rtt.buf.is_empty()).then(|| {
+            //         // We can only access the ring buffer via two
+            //         // slices, so we sum both of them together
+            //         (rtt.buf.as_slices().0.iter().sum::<u64>()
+            //          + rtt.buf.as_slices().1.iter().sum::<u64>())
+            //             // Then average over the full size of the ring
+            //             // buffer for the average of recent RTTs
+            //             / rtt.buf.len() as u64
+            //     })
+            // }) {
+            //     if let Some(state) = self.states.get_mut(actor_id) {
+            //         // We check which range-bucket the RTT is
+            //         // contained in, then update the stored index
+            //         for (ring, n) in RING_BUCKETS.iter().enumerate() {
+            //             if n.contains(&avg) {
+            //                 state.ring = Some(ring as u8);
+            //                 break;
+            //             }
+            //         }
+            //     }
+            // }
         }
     }
 

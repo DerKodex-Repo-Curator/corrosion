@@ -773,6 +773,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     PlumPrio::P0,
                 );
             }
+            // supress prunes for a recently grafted peers
+            self.prune_throttle
+                .record(send_to, rt.now(), Duration::from_secs(3 * 60));
 
             let ids = graft_requests.iter().map(|r| r.id.clone()).collect();
             // reschedule a retry if we still have more senders
@@ -878,7 +881,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         for (peer, info) in updates {
             let existing = self.peer_topology.get(&peer);
             if existing.is_none() || RingBucket::of(*existing.unwrap()) != RingBucket::of(info) {
-                info!("topology changed for peer {:?}, old: {:?}, new: {:?}", peer, existing, info);
+                info!(
+                    "topology changed for peer {:?}, old: {:?}, new: {:?}",
+                    peer, existing, info
+                );
                 self.peer_topology.insert(peer, info);
                 self.known_peers.insert(peer);
                 topology_changed = true;
