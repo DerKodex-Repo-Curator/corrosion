@@ -219,9 +219,11 @@ impl Members {
                             if n.contains(&avg) {
                                 if state.ring != Some(ring as u8) {
                                     info!(
-                                        "rtt slice 1: {:?}, rtt slice 1: {:?}",
+                                        "actor: {actor_id}, rtt slice 1: {:?}, rtt slice 1: {:?}, old ring: {:?}, new ring: {}",
                                         rtt.buf.as_slices().0,
-                                        rtt.buf.as_slices().1
+                                        rtt.buf.as_slices().1,
+                                        state.ring,
+                                        ring,
                                     );
                                 }
                                 state.ring = Some(ring as u8);
