@@ -313,7 +313,7 @@ impl<N: NodeId> PruneThrottle<N> {
     }
 }
 
-const RING_EXTRA_CONFIRMATIONS: u32 = 3;
+const RING_EXTRA_CONFIRMATIONS: u32 = 5;
 
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
