@@ -441,7 +441,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                         }
                         PlumtreeMsgV1::Graft(g) => {
                             trace!("handling plumtree graft");
-                            if (g.send == false) {
+                            if !g.send {
                                 counter!("corro.plumtree.graft.optimization").increment(1);
                             }
                             state.handle_graft(g, &mut rt);
@@ -531,7 +531,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     mut tripwire: Tripwire,
 ) {
     const MAX_INFLIGHT: usize = 500;
-    const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(20);
+    const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(10);
     const P1_GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
 
     let cluster_id = agent.cluster_id();

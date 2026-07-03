@@ -313,6 +313,8 @@ impl<N: NodeId> PruneThrottle<N> {
     }
 }
 
+const RING_EXTRA_CONFIRMATIONS: u32 = 2;
+
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
 pub struct PlumtreeState<
@@ -329,6 +331,7 @@ pub struct PlumtreeState<
     known_peers: HashSet<N>,
     ring_locked: HashSet<N>,
     peer_topology: HashMap<N, RttInfo>,
+    pending_topology: HashMap<N, (RttInfo, u32)>,
 
     lazy_queue: Vec<IHaveDigest<I>>,
     missing: HashMap<I, MissingEntry<N>>,
@@ -365,6 +368,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             known_peers: HashSet::new(),
             ring_locked: HashSet::new(),
             peer_topology: HashMap::new(),
+            pending_topology: HashMap::new(),
             lazy_queue: Vec::new(),
             missing: HashMap::new(),
             seen,
@@ -844,6 +848,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             if peer != self.local_id {
                 self.known_peers.insert(peer);
                 self.peer_topology.insert(peer, info);
+                self.pending_topology.remove(&peer);
             }
         }
         self.maybe_recompute_fanout();
@@ -858,6 +863,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         self.peer_topology.insert(peer, rtt.unwrap_or_default());
         self.known_peers.insert(peer);
+        self.pending_topology.remove(&peer);
         self.maybe_recompute_fanout();
         if self.eager_peers.len() < self.num_eager() {
             self.move_to_eager(&peer, rt);
@@ -879,15 +885,52 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let prev_count = self.known_peers().len();
         for (peer, info) in updates {
-            let existing = self.peer_topology.get(&peer);
-            if existing.is_none() || RingBucket::of(*existing.unwrap()) != RingBucket::of(info) {
-                info!(
-                    "topology changed for peer {:?}, old: {:?}, new: {:?}",
-                    peer, existing, info
-                );
-                self.peer_topology.insert(peer, info);
-                self.known_peers.insert(peer);
-                topology_changed = true;
+            match self.peer_topology.get(&peer).copied() {
+                None => {
+                    info!("topology added peer {:?}, new: {:?}", peer, info);
+                    self.commit_topology(peer, info);
+                    topology_changed = true;
+                }
+                Some(existing) => {
+                    let old_bucket = RingBucket::of(existing);
+                    let new_bucket = RingBucket::of(info);
+
+                    // change topology if we get a ring for the first time
+                    if existing.ring.is_none() && info.ring.is_some() {
+                        self.pending_topology.remove(&peer);
+                        self.peer_topology.insert(peer, info);
+                        if new_bucket != old_bucket {
+                            topology_changed = true;
+                        }
+                        continue;
+                    }
+
+                    if new_bucket == old_bucket {
+                        self.pending_topology.remove(&peer);
+                        continue;
+                    }
+
+                    let confirmations = match self.pending_topology.get(&peer) {
+                        Some((pending_info, count))
+                            if RingBucket::of(*pending_info) == new_bucket =>
+                        {
+                            count + 1
+                        }
+                        _ => 1,
+                    };
+
+                    if confirmations >= RING_EXTRA_CONFIRMATIONS {
+                        info!(
+                            "topology changed for peer {:?}, old: {:?}, new: {:?} (stable for {confirmations} runs)",
+                            peer, existing, info
+                        );
+                        self.commit_topology(peer, info);
+                        topology_changed = true;
+                    } else {
+                        // Not yet stable, record the candidate and wait.
+                        self.pending_topology.insert(peer, (info, confirmations));
+                    }
+                }
             }
         }
 
@@ -905,11 +948,18 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         }
     }
 
+    fn commit_topology(&mut self, peer: N, info: RttInfo) {
+        self.peer_topology.insert(peer, info);
+        self.known_peers.insert(peer);
+        self.pending_topology.remove(&peer);
+    }
+
     pub fn peer_down(&mut self, peer: &N, _rt: &mut impl Runtime<I, P, N>) {
         let was_eager = self.eager_peers.remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
         self.ring_locked.remove(peer);
+        self.pending_topology.remove(peer);
         if was_eager || was_lazy || self.maybe_recompute_fanout() {
             self.needs_rebalance = true;
         }
