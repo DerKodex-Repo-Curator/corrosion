@@ -251,8 +251,15 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
     fn deliver(&mut self, payload: ChangeV1) {
         let tx = self.tx_changes.clone();
         tokio::spawn(async move {
-            if let Err(e) = tx.send((payload, ChangeSource::Broadcast)).await {
-                error!("plumtree: could not deliver change: {e}");
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                tx.send((payload, ChangeSource::Broadcast)),
+            )
+            .await
+            {
+                Ok(Err(e)) => error!("plumtree: could not deliver change: {e}"),
+                Err(_) => error!("plumtree: timed out delivering change after 1s"),
+                Ok(Ok(())) => {}
             }
         });
     }
@@ -434,6 +441,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                         }
                         PlumtreeMsgV1::Graft(g) => {
                             trace!("handling plumtree graft");
+                            if (g.send == false) {
+                                counter!("corro.plumtree.graft.optimization").increment(1);
+                            }
                             state.handle_graft(g, &mut rt);
                         }
                         PlumtreeMsgV1::Prune(p) => {
@@ -448,7 +458,6 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     state.broadcast(id, change, &mut rt);
                 }
                 PlumtreeInput::QueryStats(reply) => {
-                    let cfg = state.config();
                     let stats = PlumtreeStats {
                         eager_peers: state.eager_peers().iter().copied().collect(),
                         lazy_peers: state.lazy_peers().iter().copied().collect(),
