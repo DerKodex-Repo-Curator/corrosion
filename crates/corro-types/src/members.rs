@@ -48,6 +48,10 @@ impl MemberState {
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
+/// Number of recent RTT samples retained per member and used to compute the
+/// median RTT for ring assignment.
+const RTT_WINDOW: usize = 20;
+
 /// Hysteresis dead-band as a percentage of the shared boundary value, applied
 /// only to moves between *adjacent* ring buckets. Prevents ring flapping when
 /// the average RTT sits right on a bucket boundary. Non-adjacent jumps are not
@@ -95,9 +99,31 @@ fn ring_with_hysteresis(current: Option<u8>, avg: u64) -> u8 {
     }
 }
 
+fn median_rtt(rtt: &Rtt) -> Option<u64> {
+    let len = rtt.buf.len();
+    if len == 0 {
+        return None;
+    }
+
+    let mut scratch = [0u64; RTT_WINDOW];
+    let (head, tail) = rtt.buf.as_slices();
+    scratch[..head.len()].copy_from_slice(head);
+    scratch[head.len()..len].copy_from_slice(tail);
+
+    let values = &mut scratch[..len];
+    values.sort_unstable();
+
+    let mid = len / 2;
+    Some(if len % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2
+    } else {
+        values[mid]
+    })
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
-    pub buf: CircularBuffer<20, u64>,
+    pub buf: CircularBuffer<RTT_WINDOW, u64>,
 }
 
 #[derive(Default)]
@@ -134,17 +160,11 @@ impl Members {
         }
     }
 
-    /// Rolling average RTT in milliseconds for this member (same weighting as
+    /// Median RTT in milliseconds for this member (same statistic as
     /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
     pub fn avg_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
         let addr = self.states.get(actor_id)?.addr;
-        let rtt = self.rtts.get(&addr)?;
-        if rtt.buf.is_empty() {
-            return None;
-        }
-        let sum =
-            rtt.buf.as_slices().0.iter().sum::<u64>() + rtt.buf.as_slices().1.iter().sum::<u64>();
-        Some(sum / rtt.buf.len() as u64)
+        median_rtt(self.rtts.get(&addr)?)
     }
 
     // A result of `true` means that the effective list of
@@ -242,31 +262,21 @@ impl Members {
         self.recalculate_rings(addr)
     }
 
-    /// For a given member, calculate the average RTT and update `self.ring` with
+    /// For a given member, calculate the median RTT and update `self.ring` with
     /// the index of the corresponding bucket in `RING_BUCKETS`, applying
     /// hysteresis on moves between adjacent buckets (see [`ring_with_hysteresis`])
     /// to avoid flapping when the RTT sits near a bucket boundary.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
             if let Some(rtt) = self.rtts.get(&addr) {
-                let avg = {
-                    (!rtt.buf.is_empty()).then(|| {
-                        // We can only access the ring buffer via two
-                        // slices, so we sum both of them together
-                        (rtt.buf.as_slices().0.iter().sum::<u64>()
-                         + rtt.buf.as_slices().1.iter().sum::<u64>())
-                            // Then average over the full size of the ring
-                            // buffer for the average of recent RTTs
-                            / rtt.buf.len() as u64
-                    })
-                };
+                let median = median_rtt(rtt);
 
-                if let Some(avg) = avg {
+                if let Some(median) = median {
                     if let Some(state) = self.states.get_mut(actor_id) {
-                        let new_ring = ring_with_hysteresis(state.ring, avg);
+                        let new_ring = ring_with_hysteresis(state.ring, median);
                         if state.ring != Some(new_ring) {
                             info!(
-                                "actor: {actor_id}, rtt: {:?}{:?}, old ring: {:?}, new ring: {new_ring}, avg: {avg}",
+                                "actor: {actor_id}, rtt: {:?}{:?}, old ring: {:?}, new ring: {new_ring}, median: {median}",
                                 rtt.buf.as_slices().0,
                                 rtt.buf.as_slices().1,
                                 state.ring,
