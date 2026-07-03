@@ -236,6 +236,8 @@ pub struct PlumtreeConfig {
     pub prune_threshold: u32,
     #[serde(default = "default_plumtree_optimization_threshold")]
     pub optimization_threshold: u32,
+    #[serde(default)]
+    pub batch_gossip: bool,
 }
 
 impl Default for PlumtreeConfig {
@@ -243,6 +245,7 @@ impl Default for PlumtreeConfig {
         Self {
             prune_threshold: default_plumtree_prune_threshold(),
             optimization_threshold: default_plumtree_optimization_threshold(),
+            batch_gossip: false,
         }
     }
 }

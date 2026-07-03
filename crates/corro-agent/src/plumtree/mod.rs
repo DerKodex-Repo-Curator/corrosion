@@ -536,6 +536,12 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
 
     let cluster_id = agent.cluster_id();
     let max_queue_len = agent.config().perf.processing_queue_len;
+    let batch_gossip = agent
+        .config()
+        .gossip
+        .plumtree()
+        .map(|p| p.batch_gossip)
+        .unwrap_or(false);
 
     let mut codec = LengthDelimitedCodec::builder()
         .max_frame_length(10 * 1_024 * 1_024)
@@ -610,23 +616,23 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
                     Err(()) => continue,
                 };
 
-                // if p1_gossip {
-                //     // gossip is sent to latest eager peers
-                //     p1_gossip_batch.peers = peers;
-                //     p1_gossip_batch.buf.extend_from_slice(&payload);
-                //     if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
-                //         p1_queue.push_back(PendingPlumtreeSend {
-                //             peers: std::mem::take(&mut p1_gossip_batch.peers),
-                //             payload: p1_gossip_batch.buf.split().freeze(),
-                //         });
-                //     }
-                // } else {
-                let pending = PendingPlumtreeSend { peers, payload };
-                match prio {
-                    PlumPrio::P0 => p0_queue.push_back(pending),
-                    PlumPrio::P1 => p1_queue.push_back(pending),
+                if batch_gossip && p1_gossip {
+                    // gossip is sent to latest eager peers
+                    p1_gossip_batch.peers = peers;
+                    p1_gossip_batch.buf.extend_from_slice(&payload);
+                    if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
+                        p1_queue.push_back(PendingPlumtreeSend {
+                            peers: std::mem::take(&mut p1_gossip_batch.peers),
+                            payload: p1_gossip_batch.buf.split().freeze(),
+                        });
+                    }
+                } else {
+                    let pending = PendingPlumtreeSend { peers, payload };
+                    match prio {
+                        PlumPrio::P0 => p0_queue.push_back(pending),
+                        PlumPrio::P1 => p1_queue.push_back(pending),
+                    }
                 }
-                // }
             }
         }
 
