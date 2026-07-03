@@ -322,7 +322,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         .unwrap_or_default();
 
     let config = plum_foca::Config {
-        ihave_timeout: Duration::from_millis(100),
+        ihave_timeout: Duration::from_millis(150),
         optimization_threshold: Some(plumtree_config.optimization_threshold),
         max_cached_payloads: 5000,
         num_eager: None,
