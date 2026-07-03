@@ -12,7 +12,7 @@ use corro_types::{
     agent::{Agent, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
-        ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsgV1,
+        ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsgV1, PlumtreeStats,
         PlumtreeUpdates, PlumtreeWire, UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
@@ -307,19 +307,21 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     tripwire: Tripwire,
 ) {
+    let plumtree_config = agent
+        .config()
+        .gossip
+        .plumtree()
+        .cloned()
+        .unwrap_or_default();
+
     let config = plum_foca::Config {
         ihave_timeout: Duration::from_millis(100),
-        optimization_threshold: Some(7),
+        optimization_threshold: Some(plumtree_config.optimization_threshold),
         max_cached_payloads: 5000,
         num_eager: None,
         min_lazy: None,
         max_lazy: None,
-        prune_threshold: agent
-            .config()
-            .gossip
-            .plumtree()
-            .expect("plumtree loop requires plumtree broadcast method")
-            .prune_threshold,
+        prune_threshold: plumtree_config.prune_threshold,
         max_received_entries: 10000,
         // Suppress repeat PRUNEs to a peer within this window
         prune_throttle: Some(Duration::from_secs(1)),
@@ -444,6 +446,22 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     let id = change.message_id();
                     trace!("plumtree: broadcasting change: {id:?}");
                     state.broadcast(id, change, &mut rt);
+                }
+                PlumtreeInput::QueryStats(reply) => {
+                    let cfg = state.config();
+                    let stats = PlumtreeStats {
+                        eager_peers: state.eager_peers().iter().copied().collect(),
+                        lazy_peers: state.lazy_peers().iter().copied().collect(),
+                        ring_locked_peers: state.ring_locked_peers().iter().copied().collect(),
+                        known_peers: state.known_peers().len(),
+                        num_eager_target: state.num_eager(),
+                        min_lazy_target: state.min_lazy(),
+                        max_lazy_target: state.max_lazy(),
+                        lazy_queue_len: state.lazy_queue().len(),
+                        seen_cache_size: state.seen_cache_size(),
+                        payload_cache_size: state.payload_cache_size(),
+                    };
+                    let _ = reply.send(stats);
                 }
             },
             Branch::Updates(updates) => match updates {

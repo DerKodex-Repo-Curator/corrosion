@@ -226,16 +226,23 @@ pub fn default_plumtree_prune_threshold() -> u32 {
     5
 }
 
+pub fn default_plumtree_optimization_threshold() -> u32 {
+    7
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
     pub prune_threshold: u32,
+    #[serde(default = "default_plumtree_optimization_threshold")]
+    pub optimization_threshold: u32,
 }
 
 impl Default for PlumtreeConfig {
     fn default() -> Self {
         Self {
             prune_threshold: default_plumtree_prune_threshold(),
+            optimization_threshold: default_plumtree_optimization_threshold(),
         }
     }
 }

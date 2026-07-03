@@ -123,6 +123,32 @@ pub enum PlumtreeInput {
     Wire(PlumtreeMsgV1),
     /// Application wants to originate a new broadcast.
     Broadcast(ChangeV1),
+    /// Diagnostics: request a snapshot of the current plumtree state.
+    QueryStats(oneshot::Sender<PlumtreeStats>),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlumtreeStats {
+    /// Peers we push GOSSIP to directly (the spanning-tree branches).
+    pub eager_peers: Vec<ActorId>,
+    /// Peers we only send IHAVE digests to.
+    pub lazy_peers: Vec<ActorId>,
+    /// Peers pinned to eager because of their ring/latency.
+    pub ring_locked_peers: Vec<ActorId>,
+    /// Total number of peers known to the overlay.
+    pub known_peers: usize,
+    /// Target number of eager peers (fanout).
+    pub num_eager_target: usize,
+    /// Target minimum number of lazy peers.
+    pub min_lazy_target: usize,
+    /// Target maximum number of lazy peers.
+    pub max_lazy_target: usize,
+    /// Number of pending IHAVE digests queued for lazy peers.
+    pub lazy_queue_len: usize,
+    /// Number of message ids currently tracked in the seen cache.
+    pub seen_cache_size: usize,
+    /// Number of cached payloads available to answer GRAFTs.
+    pub payload_cache_size: usize,
 }
 
 #[derive(Debug)]
