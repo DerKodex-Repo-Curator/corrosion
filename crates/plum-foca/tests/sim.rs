@@ -169,18 +169,21 @@ struct NotificationStats {
 }
 
 #[derive(Default)]
-struct Outbox {
-    sent: Vec<(NId, PlumtreeMsg<MId, SimPayload, NId>)>,
-    scheduled: Vec<(Timer<MId, NId>, Duration)>,
-    delivered: Vec<SimPayload>,
+struct SimRuntime {
+    // Collects outgoing protocol messages
+    // (DstNodeId, PlumtreeMsg<MessageId, .., SrcNodeId>)
+    outbox: Vec<(NId, PlumtreeMsg<MId, SimPayload, NId>)>,
+    timers: Vec<(Timer<MId, NId>, Duration)>,
+    // Payloads the protocol delivered this step.
+    inbox: Vec<SimPayload>,
     notification_stats: NotificationStats,
     /// current virtual time in µs, kept in sync with `Sim::now`
     now_us: u64,
 }
 
-impl Runtime<MId, SimPayload, NId> for Outbox {
+impl Runtime<MId, SimPayload, NId> for SimRuntime {
     fn send(&mut self, to: NId, msg: PlumtreeMsg<MId, SimPayload, NId>, _prio: PlumPrio) {
-        self.sent.push((to, msg));
+        self.outbox.push((to, msg));
     }
 
     fn send_all(
@@ -190,16 +193,16 @@ impl Runtime<MId, SimPayload, NId> for Outbox {
         _prio: PlumPrio,
     ) {
         for peer in peers {
-            self.sent.push((peer, msg.clone()));
+            self.outbox.push((peer, msg.clone()));
         }
     }
 
     fn deliver(&mut self, payload: SimPayload) {
-        self.delivered.push(payload);
+        self.inbox.push(payload);
     }
 
     fn schedule(&mut self, timer: Timer<MId, NId>, after: Duration) {
-        self.scheduled.push((timer, after));
+        self.timers.push((timer, after));
     }
 
     fn notify(&mut self, notification: Notification<'_, MId, NId>) {
@@ -365,7 +368,7 @@ struct Sim {
     region_of: Vec<u8>,
     rtt_ms: Vec<Vec<u64>>,
     rng: StdRng,
-    outbox: Outbox,
+    runtime: SimRuntime,
     tick_pending: Vec<bool>,
     /// Round of the gossip message currently being handled, for hop
     /// attribution of the deliveries it produces.
@@ -415,7 +418,7 @@ impl Sim {
 
         // Full-membership bootstrap: every node knows every other node, the
         // way corrosion clusters work today.
-        let mut outbox = Outbox::default();
+        let mut rt = SimRuntime::default();
         for i in 0..n {
             let peers: Vec<(NId, RttInfo)> = (0..n)
                 .filter(|&j| j != i)
@@ -431,10 +434,10 @@ impl Sim {
                     (j as NId, info)
                 })
                 .collect();
-            states[i].add_peers_bulk_with_rtt(peers, &mut outbox);
+            states[i].add_peers_bulk_with_rtt(peers, &mut rt);
         }
         // bootstrap produces no traffic
-        assert!(outbox.sent.is_empty() && outbox.scheduled.is_empty());
+        assert!(rt.outbox.is_empty() && rt.timers.is_empty());
 
         let mut sim = Self {
             now: 0,
@@ -444,7 +447,7 @@ impl Sim {
             region_of,
             rtt_ms,
             rng,
-            outbox,
+            runtime: rt,
             tick_pending: vec![false; n],
             gossip_round: None,
             msgs: HashMap::new(),
@@ -511,7 +514,7 @@ impl Sim {
         while let Some(Scheduled { at, ev, .. }) = self.queue.pop() {
             debug_assert!(at >= self.now);
             self.now = at;
-            self.outbox.now_us = at;
+            self.runtime.now_us = at;
             match ev {
                 Event::Originate { node, seq } => {
                     let payload = SimPayload { origin: node, seq };
@@ -525,7 +528,7 @@ impl Sim {
                             last_delivery_at: 0,
                         },
                     );
-                    self.states[node as usize].broadcast(id, payload, &mut self.outbox);
+                    self.states[node as usize].broadcast(id, payload, &mut self.runtime);
                     self.drain(node);
                 }
                 Event::Recv { to, msg } => {
@@ -533,24 +536,24 @@ impl Sim {
                     match msg {
                         PlumtreeMsg::Gossip(g) => {
                             self.gossip_round = Some(g.round);
-                            state.handle_gossip(g, &mut self.outbox);
+                            state.handle_gossip(g, &mut self.runtime);
                         }
-                        PlumtreeMsg::IHave(ih) => state.handle_ihave(ih, &mut self.outbox),
-                        PlumtreeMsg::Graft(g) => state.handle_graft(g, &mut self.outbox),
-                        PlumtreeMsg::Prune(p) => state.handle_prune(p, &mut self.outbox),
+                        PlumtreeMsg::IHave(ih) => state.handle_ihave(ih, &mut self.runtime),
+                        PlumtreeMsg::Graft(g) => state.handle_graft(g, &mut self.runtime),
+                        PlumtreeMsg::Prune(p) => state.handle_prune(p, &mut self.runtime),
                     }
                     self.drain(to);
                     self.gossip_round = None;
                 }
                 Event::TimerFired { node, timer } => {
-                    self.states[node as usize].timer_fired(timer, &mut self.outbox);
+                    self.states[node as usize].timer_fired(timer, &mut self.runtime);
                     self.drain(node);
                 }
                 Event::Tick { node } => {
                     self.tick_pending[node as usize] = false;
                     let state = &mut self.states[node as usize];
-                    state.cache_evict_if_needed(&mut self.outbox);
-                    state.tick(&mut self.outbox);
+                    state.cache_evict_if_needed(&mut self.runtime);
+                    state.tick(&mut self.runtime);
                     self.drain(node);
                 }
             }
@@ -561,7 +564,7 @@ impl Sim {
 
     /// Apply everything the node just asked the runtime to do.
     fn drain(&mut self, from: NId) {
-        for payload in std::mem::take(&mut self.outbox.delivered) {
+        for payload in std::mem::take(&mut self.runtime.inbox) {
             let stat = self
                 .msgs
                 .get_mut(&payload.id())
@@ -574,7 +577,7 @@ impl Sim {
             self.stats.hops.push(round + 1);
         }
 
-        let notification_stats = std::mem::take(&mut self.outbox.notification_stats);
+        let notification_stats = std::mem::take(&mut self.runtime.notification_stats);
         self.stats.duplicates += notification_stats.duplicates;
         self.stats.missing += notification_stats.missing;
         self.stats.not_cached += notification_stats.not_cached;
@@ -582,12 +585,12 @@ impl Sim {
         self.stats.demotions += notification_stats.demotions;
         self.stats.prune_suppressed += notification_stats.prune_suppressed;
 
-        for (timer, after) in std::mem::take(&mut self.outbox.scheduled) {
+        for (timer, after) in std::mem::take(&mut self.runtime.timers) {
             let at = self.now + after.as_micros() as u64;
             self.push(at, Event::TimerFired { node: from, timer });
         }
 
-        for (to, msg) in std::mem::take(&mut self.outbox.sent) {
+        for (to, msg) in std::mem::take(&mut self.runtime.outbox) {
             match &msg {
                 PlumtreeMsg::Gossip(g) => {
                     self.stats.sent_gossip += 1;

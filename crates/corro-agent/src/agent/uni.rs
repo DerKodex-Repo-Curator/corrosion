@@ -11,7 +11,7 @@ use plum_foca::GossipMsg;
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
@@ -101,6 +101,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                             if let PlumtreeMsgV1::Gossip(msg) =
                                                                 wire_msg
                                                             {
+                                                                warn!("broadcast algorithm set to gossip but node receieved plumtree message");
                                                                 changes.push(msg.payload);
                                                             }
                                                         }
@@ -133,6 +134,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                         match broadcast_method {
                             BroadcastMethod::Plumtree => {
+                                warn!("broadcast algorithm set to plumtree but node receieved gossip message.");
                                 for change in changes.into_iter().rev() {
                                     let wire = PlumtreeMsgV1::Gossip(GossipMsg {
                                         round: 1,

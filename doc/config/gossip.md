@@ -64,7 +64,10 @@ Certain environments don't support GSO (Generic Segmentation Offload). This is d
 
 #### `gossip.broadcast`
 
-Selects the algorithm used to disseminate changes across the cluster. Two methods are available:
+Selects the algorithm used to disseminate changes across the cluster. Please note that all nodes in a cluster need to use the same broadcast
+algorithm.
+
+Two methods are available:
 
 - `gossip` (**default**): SWIM-style gossip. Each change is re-broadcast to a random subset of peers. Robust and simple, but every hop carries the full payload, so bandwidth grows with cluster size.
 - `plumtree`: [Plumtree](https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf) epidemic broadcast. Nodes build a spanning tree of "eager" peers that forward full payloads, while the remaining "lazy" peers only exchange lightweight `IHave` announcements and pull (`GRAFT`) the payload on demand. This cuts redundant payload traffic on larger clusters, at the cost of some protocol complexity.

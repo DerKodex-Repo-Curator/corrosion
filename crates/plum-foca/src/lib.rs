@@ -18,7 +18,7 @@ pub trait Payload: Clone + Debug + Send + 'static {
     fn origin(&self) -> Self::NodeId;
 }
 
-pub trait NodeId: Copy + Eq + Hash + Ord + Debug + Send + 'static {}
+pub trait NodeId: Copy + Eq + Hash + Ord + Debug + Send {}
 
 impl<T> MessageId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
 impl<T> NodeId for T where T: Copy + Eq + Hash + Ord + Debug + Send + 'static {}
@@ -168,7 +168,7 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
     /// Observable protocol event.
     fn notify(&mut self, notification: Notification<'_, I, N>);
 
-    /// Current time. The state machine is sans-IO and owns no clock, so the
+    /// Current time. The state machine is sans-IO(sans-io.readthedocs.io) and owns no clock, so the
     /// runtime supplies one.
     fn now(&self) -> Instant;
 }
