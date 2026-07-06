@@ -341,25 +341,42 @@ pub struct PlumtreeState<
     N: NodeId,
     S: SeenStore<I>,
 > {
+    /// This node's own id, excluded from every peer set.
     local_id: N,
+    /// Tunables (fanout sizes, thresholds, throttles).
     config: Config,
 
+    /// Peers on the spanning tree: they get full `Gossip` payloads (push).
     eager_peers: HashSet<N>,
+    /// Lazy peers only get `IHave` digests (lazy push).
     lazy_peers: IndexSet<N>,
+    /// Every peer we know about, eager or lazy; drives.
     known_peers: HashSet<N>,
+    /// Eager peers pinned to the tree because they are our immediate ring
+    /// neighbors; they are never pruned, ensuring a node is never isolated.
     ring_locked: HashSet<N>,
+    /// Per-per rtt information.
     peer_topology: HashMap<N, RttInfo>,
+    /// Candidate topology change awaiting confirmation
     pending_topology: HashMap<N, (RttInfo, u32)>,
 
+    /// Digests buffered since the last tick, flushed to lazy peers as `IHave`.
     lazy_queue: Vec<IHaveDigest<I>>,
+    /// Messages announced via `IHave` but not yet received
     missing: HashMap<I, MissingEntry<N>>,
 
+    /// Dedup store: message ids we've already delivered, to drop duplicates.
     seen: S,
+    /// Recently-delivered payloads, kept so we can answer inbound `Graft`s.
     cache: PayloadCache<I, P>,
+    /// PRNG for random peer selection (seedable for deterministic tests).
     rng: SmallRng,
+    /// Rate-limits outbound `Prune`s per peer to avoid flapping links.
     prune_throttle: PruneThrottle<N>,
     /// set on membership updates so we'd rebalance peers on next tick.
     needs_rebalance: bool,
+    // target number of eager and lazy peers, calculated based on config
+    // or cluster size if config is not set.
     fanout: FanoutTargets,
 }
 
