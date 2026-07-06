@@ -173,7 +173,13 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
     fn now(&self) -> Instant;
 }
 
-/// Messages exchanged between Plumtree peers.
+/// A protocol message exchanged between Plumtree peers.
+///
+/// Each peer keeps two overlays over the same neighbor set: an eager set that
+/// forms a spanning tree and receives full payloads (push), and a lazy set
+/// that only receives message_id digests and pulls the payload on demand.
+/// `Graft` and `Prune` move a link between the two sets to repair and optimize
+/// the tree.
 #[derive(Debug, Clone, Readable, Writable, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum PlumtreeMsg<I, P, N>
@@ -182,9 +188,21 @@ where
     P: Payload<MessageId = I, NodeId = N>,
     N: NodeId,
 {
+    /// Full payload pushed to an eager-set peer. This is how messages actually
+    /// propagate along the spanning tree.
     Gossip(GossipMsg<I, P, N>),
+    /// Lazy-push digest: contains batch of recently-seen message ids that is sent to lazy
+    /// peers on a tick. Lets a peer notice a message it never received eagerly
+    /// and `Graft` to fetch it.
     IHave(IHaveMsg<I, N>),
+    /// Ask the recipient to add us to its eager set (and, when `send` is set,
+    /// to reply with the full payload). Sent when an `IHave` reveals a message
+    /// that never arrived eagerly (tree repair) or to adopt a shorter path
+    /// (optimization).
     Graft(GraftMsg<I, N>),
+    /// Ask the recipient to remove us from its eager set, demoting the link to
+    /// lazy. Sent after a duplicate `Gossip` arrives once the duplicate count
+    /// crosses `Config::prune_threshold`, which signals a redundant tree edge.
     Prune(PruneMsg<I, N>),
 }
 
