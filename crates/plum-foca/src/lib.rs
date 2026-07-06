@@ -60,8 +60,8 @@ pub struct Config {
     /// How long to wait after receiving an IHave before sending a GRAFT
     /// if the full message hasn't arrived yet.
     pub ihave_timeout: Duration,
-    /// Optimization threshold in rounds. Controls when a node receiving
-    /// a GOSSIP will attempt to GRAFT a shorter-path peer (via IHave)
+    /// Optimization threshold in rounds. This is the minimum amount by which a lazy peer's
+    /// IHAVE round must beat our eager-delivery round before we attempt to graft the lazy peer.
     pub optimization_threshold: Option<Round>,
     /// Number of eager peers (fanout). `None` derives it from cluster size:
     /// `round(log10(known_peers + 1) * 3)` (min 3).

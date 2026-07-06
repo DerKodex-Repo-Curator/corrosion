@@ -662,10 +662,12 @@ impl Sim {
             .collect();
         full.sort_unstable();
 
-        // RMR per message, in broadcast order, to show tree convergence
+        // duplicate copies delivered per message, in broadcast order, to show
+        // tree convergence. 0 = perfect spanning tree (no duplicates); >0 = extra
+        // copies each node receives on average.
         let mut by_time: Vec<&MsgStat> = self.msgs.values().collect();
         by_time.sort_unstable_by_key(|m| m.sent_at);
-        let rmr = |msgs: &[&MsgStat]| -> f64 {
+        let dups_per_msg = |msgs: &[&MsgStat]| -> f64 {
             if msgs.is_empty() {
                 return 0.0;
             }
@@ -673,8 +675,8 @@ impl Sim {
             sends as f64 / (msgs.len() as f64 * (self.params.n - 1) as f64) - 1.0
         };
         let decile = (by_time.len() / 10).max(1);
-        let rmr_first = rmr(&by_time[..decile]);
-        let rmr_last = rmr(&by_time[by_time.len() - decile..]);
+        let dups_per_msg_first = dups_per_msg(&by_time[..decile]);
+        let dups_per_msg_last = dups_per_msg(&by_time[by_time.len() - decile..]);
 
         let avg_eager = self
             .states
@@ -703,8 +705,8 @@ impl Sim {
             full_p50_ms: pct(&full, 0.50) / 1000,
             full_p99_ms: pct(&full, 0.99) / 1000,
             full_max_ms: full.last().copied().unwrap_or(0) / 1000,
-            rmr_first,
-            rmr_last,
+            dups_per_msg_first,
+            dups_per_msg_last,
             sent_gossip: self.stats.sent_gossip,
             sent_ihave: self.stats.sent_ihave,
             sent_graft: self.stats.sent_graft,
@@ -741,8 +743,8 @@ struct Report {
     full_p50_ms: u64,
     full_p99_ms: u64,
     full_max_ms: u64,
-    rmr_first: f64,
-    rmr_last: f64,
+    dups_per_msg_first: f64,
+    dups_per_msg_last: f64,
     sent_gossip: u64,
     sent_ihave: u64,
     sent_graft: u64,
@@ -786,8 +788,8 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
-            "  redundancy rmr first-decile={:.2} last-decile={:.2}  duplicates={}",
-            self.rmr_first, self.rmr_last, self.duplicates
+            "  duplicates per msg first-decile={:.2} last-decile={:.2}  duplicates={}",
+            self.dups_per_msg_first, self.dups_per_msg_last, self.duplicates
         )?;
         writeln!(
             f,
@@ -1157,11 +1159,11 @@ impl GossipSim {
             .collect();
         full.sort_unstable();
 
-        // RMR over all messages (relative message redundancy).
-        let total_sends: u64 = self.msgs.values().map(|m| m.gossip_sends).sum();
-        let rmr = if self.msgs.is_empty() {
+        // measure duplicate sends over all messages.
+        let dups_per_msg = if self.msgs.is_empty() {
             0.0
         } else {
+            let total_sends: u64 = self.msgs.values().map(|m| m.gossip_sends).sum();
             total_sends as f64 / (self.msgs.len() as f64 * (self.params.n - 1) as f64) - 1.0
         };
 
@@ -1188,9 +1190,9 @@ impl GossipSim {
             full_p50_ms: pct(&full, 0.50) / 1000,
             full_p99_ms: pct(&full, 0.99) / 1000,
             full_max_ms: full.last().copied().unwrap_or(0) / 1000,
-            // gossip has no tree to converge; report the single RMR in both slots.
-            rmr_first: rmr,
-            rmr_last: rmr,
+            // gossip has no tree to converge; report the single value in both slots.
+            dups_per_msg_first: dups_per_msg,
+            dups_per_msg_last: dups_per_msg,
             sent_gossip: self.stats.sent_gossip,
             sent_ihave: 0,
             sent_graft: 0,
@@ -1316,7 +1318,8 @@ fn sim_2k_num_eager_sweep() {
 }
 
 /// Baseline: foca gossip broadcast at small scale. Characterizes the redundancy
-/// (RMR) and delivery of the current production path on the same topology.
+/// (duplicate copies per message) and delivery of the current production path on
+/// the same topology.
 #[test]
 fn sim_gossip_small() {
     let report = GossipSim::new(GossipParams::new(200)).run();
@@ -1328,18 +1331,18 @@ fn sim_gossip_small() {
         "gossip delivery {:.2}% unexpectedly low",
         report.delivery_pct()
     );
-    // each relaying node sprays a large fraction of the cluster: RMR is high.
+    // each relaying node sprays a large fraction of the cluster: dups/msg is high.
     assert!(
-        report.rmr_first > 1.0,
-        "gossip RMR {:.2} unexpectedly low",
-        report.rmr_first
+        report.dups_per_msg_first > 1.0,
+        "gossip dups/msg {:.2} unexpectedly low",
+        report.dups_per_msg_first
     );
 }
 
 /// Head-to-head: the current foca gossip broadcast vs plumtree at 2k, on the
 /// same topology, printed as one comparison table. This is the "what does
-/// plumtree buy us" test. RMR is the key number (redundant transmissions per
-/// delivery); `sends/msg` = (RMR+1)·(N-1) is the absolute per-change cost.
+/// plumtree buy us" test. dups/msg is the key number (redundant copies delivered
+/// per message); `sends/msg` = (dups/msg + 1)·(N-1) is the absolute per-change cost.
 /// Run with: cargo test --release -p plum-foca --test sim -- --ignored --nocapture
 #[test]
 #[ignore = "slow; run in release mode"]
@@ -1352,7 +1355,7 @@ fn sim_gossip_vs_plumtree_2k() {
     println!("plumtree (num_eager=8):\n{plum}");
 
     let row = |name: &str, g: String, p: String| println!("  {name:<22}{g:>16}{p:>16}");
-    let sends_per_msg = |r: &Report| (r.rmr_first + 1.0) * (N as f64 - 1.0);
+    let sends_per_msg = |r: &Report| (r.dups_per_msg_first + 1.0) * (N as f64 - 1.0);
     println!("\n=== gossip vs plumtree (n={N}, full membership) ===");
     row("metric", "gossip".into(), "plumtree".into());
     row(
@@ -1376,9 +1379,9 @@ fn sim_gossip_vs_plumtree_2k() {
         plum.full_p99_ms.to_string(),
     );
     row(
-        "RMR (redundancy)",
-        format!("{:.1}", gossip.rmr_first),
-        format!("{:.1}", plum.rmr_last),
+        "dups/msg (redundancy)",
+        format!("{:.1}", gossip.dups_per_msg_first),
+        format!("{:.1}", plum.dups_per_msg_last),
     );
     row(
         "sends/change",
@@ -1398,10 +1401,10 @@ fn sim_gossip_vs_plumtree_2k() {
     // The whole point of plumtree: drastically lower redundancy at comparable
     // convergence. Guard the headline result so a regression is caught.
     assert!(
-        plum.rmr_last < gossip.rmr_first / 5.0,
-        "plumtree RMR {:.1} not dramatically below gossip RMR {:.1}",
-        plum.rmr_last,
-        gossip.rmr_first
+        plum.dups_per_msg_last < gossip.dups_per_msg_first / 5.0,
+        "plumtree dups/msg {:.1} not dramatically below gossip dups/msg {:.1}",
+        plum.dups_per_msg_last,
+        gossip.dups_per_msg_first
     );
 }
 
