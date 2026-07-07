@@ -25,8 +25,8 @@ static SIM_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 use indexmap::IndexMap;
 use plum_foca::{
-    Config, Notification, Payload, PlumPrio, PlumtreeMsg, PlumtreeState, Round, RttInfo, Runtime,
-    SeenStore, Timer,
+    Config, EagerRatios, Notification, Payload, PlumPrio, PlumtreeMsg, PlumtreeState, Round,
+    RttInfo, Runtime, SeenStore, Timer,
 };
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -289,6 +289,7 @@ struct Params {
     /// over-full eager set (e.g. admission without trimming). 0 = none.
     eager_inflate: usize,
     seed: u64,
+    eager_ratios: EagerRatios,
 }
 
 impl Params {
@@ -304,7 +305,13 @@ impl Params {
             prune_throttle: None,
             eager_inflate: 0,
             seed: 42,
+            eager_ratios: EagerRatios::default(),
         }
+    }
+
+    fn with_eager_ratios(mut self, eager_ratios: EagerRatios) -> Self {
+        self.eager_ratios = eager_ratios;
+        self
     }
 
     /// Production config from `spawn_plumtree_loop`, with `num_eager`
@@ -320,6 +327,7 @@ impl Params {
             max_received_entries: (self.n as u32 * self.msgs_per_node) as usize + 1,
             max_cached_payloads: 4096,
             prune_throttle: self.prune_throttle,
+            eager_ratios: self.eager_ratios,
         }
     }
 
@@ -687,9 +695,12 @@ impl Sim {
 
         Report {
             label: format!(
-                "n={} num_eager={} rtt_aware={} loss={:.1}% seed={}",
+                "n={} num_eager={} eager={}/{}/{} rtt_aware={} loss={:.1}% seed={}",
                 self.params.n,
                 self.params.num_eager,
+                self.params.eager_ratios.near_pct,
+                self.params.eager_ratios.mid_pct,
+                self.params.eager_ratios.far_pct,
                 self.params.rtt_aware,
                 self.params.loss * 100.0,
                 self.params.seed,
@@ -1317,6 +1328,60 @@ fn sim_2k_num_eager_sweep() {
     );
 }
 
+/// 2k nodes: compare near/mid/far eager ratio splits.
+/// Run with: cargo test --release -p plum-foca --test sim sim_2k_eager_ratios_sweep -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_2k_eager_ratios_sweep() {
+    const N: usize = 2000;
+    let cases: [(&str, EagerRatios); 4] = [
+        (
+            "near-heavy (default)",
+            EagerRatios {
+                near_pct: 50,
+                mid_pct: 30,
+                far_pct: 20,
+            },
+        ),
+        (
+            "balanced",
+            EagerRatios {
+                near_pct: 40,
+                mid_pct: 30,
+                far_pct: 30,
+            },
+        ),
+        (
+            "far-heavy",
+            EagerRatios {
+                near_pct: 30,
+                mid_pct: 35,
+                far_pct: 35,
+            },
+        ),
+        (
+            "near small",
+            EagerRatios {
+                near_pct: 20,
+                mid_pct: 40,
+                far_pct: 40,
+            },
+        ),
+    ];
+
+    let mut reports = Vec::new();
+    for (name, ratios) in cases {
+        let report = Sim::new(Params::new(N, 8).with_eager_ratios(ratios)).run();
+        println!("{name}:\n{report}");
+        assert_eq!(
+            report.delivered, report.expected,
+            "incomplete delivery for {name}"
+        );
+        assert_eq!(report.missing, 0, "missing messages for {name}");
+        reports.push((name, report));
+    }
+}
+
 /// Baseline: foca gossip broadcast at small scale. Characterizes the redundancy
 /// (duplicate copies per message) and delivery of the current production path on
 /// the same topology.
@@ -1427,6 +1492,7 @@ fn sim_gossip_2k() {
 #[test]
 #[ignore = "slow; run in release mode"]
 fn sim_2k_rtt_awareness() {
+    init_trace_logging();
     let aware = Sim::new(Params::new(2000, 8)).run();
     let mut blind_params = Params::new(2000, 8);
     blind_params.rtt_aware = false;

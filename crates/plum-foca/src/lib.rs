@@ -2,7 +2,9 @@ use indexmap::{IndexMap, IndexSet};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
+use thiserror::Error;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -54,6 +56,50 @@ impl RingBucket {
     }
 }
 
+/// Split eager (and lazy) peers across Near/Mid/Far RTT buckets.
+/// Values are percentages of the target fanout; default values are (~50% near, ~30% mid, ~20% far).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EagerRatios {
+    pub near_pct: u8,
+    pub mid_pct: u8,
+    pub far_pct: u8,
+}
+
+impl Default for EagerRatios {
+    fn default() -> Self {
+        Self {
+            near_pct: 50,
+            mid_pct: 30,
+            far_pct: 20,
+        }
+    }
+}
+
+impl EagerRatios {
+    pub fn validate(&self) -> Result<(), EagerRatiosError> {
+        let sum = self.near_pct as u16 + self.mid_pct as u16 + self.far_pct as u16;
+        if sum != 100 {
+            return Err(EagerRatiosError {
+                near_pct: self.near_pct,
+                mid_pct: self.mid_pct,
+                far_pct: self.far_pct,
+                sum,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("eager ratios must sum to 100, got near={near_pct}, mid={mid_pct}, far={far_pct} (sum={sum})")]
+pub struct EagerRatiosError {
+    pub near_pct: u8,
+    pub mid_pct: u8,
+    pub far_pct: u8,
+    pub sum: u16,
+}
+
 /// Tunable parameters for the Plumtree protocol.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -79,6 +125,8 @@ pub struct Config {
     pub max_cached_payloads: usize,
     /// If set, suppress repeat PRUNEs to the same peer within this window.
     pub prune_throttle: Option<Duration>,
+    /// Near/Mid/Far split when selecting eager and lazy peers during rebalance.
+    pub eager_ratios: EagerRatios,
 }
 
 impl Default for Config {
@@ -93,6 +141,7 @@ impl Default for Config {
             max_received_entries: 10000,
             max_cached_payloads: 8192,
             prune_throttle: None,
+            eager_ratios: EagerRatios::default(),
         }
     }
 }
@@ -589,7 +638,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         trace!(
             ?self_actor_id,
             ?sender,
-            "forwarding gossip to {} eager peers (id: {id:?}, peers: {peers:?})",
+            "forwarding gossip to {} eager peers (id: {id:?}, round: {next_round}, peers: {peers:?})",
             peers.len(),
         );
         if !peers.is_empty() {
@@ -1095,14 +1144,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         // pools exclude ring_locked peers so they aren't reselected.
         let (near_pool, mid_pool, far_pool) = self.bucket_pools();
 
-        // we mostly want eager peers to be low rtt, but throw in a mix of mid and far peers;
-        // percentage is roughly 50% near, 30% mid, 20% far. targets are computed over the
-        // full bucket population (pool + locked), then the locked share is subtracted.
+        // Near/Mid/Far split for eager and lazy peer selection (see `EagerRatios`).
         let (near_t, mid_t, far_t) = Self::bucket_targets(
             num_eager,
             near_pool.len() + locked_near,
             mid_pool.len() + locked_mid,
             far_pool.len() + locked_far,
+            self.config.eager_ratios,
         );
         let eager_near = near_t.saturating_sub(locked_near);
         let eager_mid = mid_t.saturating_sub(locked_mid);
@@ -1123,6 +1171,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             near_pool.len().saturating_sub(eager_near),
             mid_pool.len().saturating_sub(eager_mid),
             far_pool.len().saturating_sub(eager_far),
+            self.config.eager_ratios,
         );
 
         self.lazy_peers
@@ -1167,11 +1216,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         near_cap: usize,
         mid_cap: usize,
         far_cap: usize,
+        ratios: EagerRatios,
     ) -> (usize, usize, usize) {
-        let near = (num_eager * 50).div_ceil(100).min(near_cap);
-        let mid = (num_eager.saturating_sub(near) * 60)
-            .div_ceil(100)
-            .min(mid_cap);
+        debug_assert!(ratios.validate().is_ok());
+        let near_pct = ratios.near_pct as usize;
+        let mid_pct = ratios.mid_pct as usize;
+        let near = (num_eager * near_pct).div_ceil(100).min(near_cap);
+        let mid = (num_eager * mid_pct).div_ceil(100).min(mid_cap);
         let far = num_eager.saturating_sub(near + mid).min(far_cap);
 
         // update near and mid, if we still have some room
@@ -1386,6 +1437,7 @@ mod tests {
             prune_threshold: 1,
             max_received_entries: 10000,
             prune_throttle: None,
+            eager_ratios: EagerRatios::default(),
         }
     }
 

@@ -3701,6 +3701,7 @@ dependencies = [
  "serde",
  "speedy",
  "strum",
+ "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
 ]

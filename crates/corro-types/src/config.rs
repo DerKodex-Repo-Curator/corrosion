@@ -238,6 +238,9 @@ pub struct PlumtreeConfig {
     pub optimization_threshold: u32,
     #[serde(default)]
     pub batch_gossip: bool,
+    /// Near/Mid/Far split when selecting eager and lazy peers.
+    #[serde(default)]
+    pub eager_ratios: plum_foca::EagerRatios,
 }
 
 impl Default for PlumtreeConfig {
@@ -246,6 +249,7 @@ impl Default for PlumtreeConfig {
             prune_threshold: default_plumtree_prune_threshold(),
             optimization_threshold: default_plumtree_optimization_threshold(),
             batch_gossip: false,
+            eager_ratios: plum_foca::EagerRatios::default(),
         }
     }
 }
@@ -457,6 +461,8 @@ pub enum ConfigError {
     Config(#[from] config::ConfigError),
     #[error("gossip.max_mtu value {value} is below the QUIC minimum of 1200 (RFC 9000)")]
     InvalidMaxMtu { value: u16 },
+    #[error("{0}")]
+    InvalidEagerRatios(#[from] plum_foca::EagerRatiosError),
 }
 
 impl Config {
@@ -480,6 +486,9 @@ impl Config {
             if mtu < 1200 {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
+        }
+        if let Some(plumtree) = self.gossip.plumtree() {
+            plumtree.eager_ratios.validate()?;
         }
         Ok(())
     }
@@ -741,5 +750,16 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
         assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
+    }
+
+    #[test]
+    fn plumtree_eager_ratios_must_sum_to_100() {
+        let ratios = plum_foca::EagerRatios {
+            near_pct: 60,
+            mid_pct: 30,
+            far_pct: 20,
+        };
+        assert!(ratios.validate().is_err());
+        assert!(plum_foca::EagerRatios::default().validate().is_ok());
     }
 }
