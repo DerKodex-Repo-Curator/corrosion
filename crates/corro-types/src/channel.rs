@@ -73,9 +73,7 @@ pub fn bounded<T: Send + 'static>(
     let (tx, rx) = channel(capacity);
 
     let threshold = (capacity as f64 * 0.9) as usize;
-    // Only hold a *weak* sender for metrics: this task must not keep the channel
-    // open. Once all real senders are dropped, `upgrade()` returns `None`, the
-    // receiver observes the channel as closed, and we stop reporting.
+    // weeak sender so metrics loop won't keep channel open
     let weak_channel = tx.downgrade();
     tokio::spawn(async move {
         let mut ticks_since_report = 0;
