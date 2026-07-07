@@ -254,14 +254,48 @@ where
     pub requests: Vec<GraftRequest<I>>,
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone)]
 pub struct PruneMsg<I, N>
 where
     I: MessageId,
     N: NodeId,
 {
     pub sender: N,
-    pub triggered_by: I,
+    pub triggered_by: Option<I>,
+}
+
+// NOTE: speedy's derive can't express the bounds needed to (de)serialize an
+// `Option<I>` field over a generic `I`, so we implement the traits by hand.
+impl<'a, C, I, N> speedy::Readable<'a, C> for PruneMsg<I, N>
+where
+    C: speedy::Context,
+    I: MessageId + speedy::Readable<'a, C>,
+    N: NodeId + speedy::Readable<'a, C>,
+{
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        Ok(Self {
+            sender: reader.read_value()?,
+            triggered_by: reader.read_value()?,
+        })
+    }
+
+    fn minimum_bytes_needed() -> usize {
+        <N as speedy::Readable<'a, C>>::minimum_bytes_needed()
+            + <Option<I> as speedy::Readable<'a, C>>::minimum_bytes_needed()
+    }
+}
+
+impl<C, I, N> speedy::Writable<C> for PruneMsg<I, N>
+where
+    C: speedy::Context,
+    I: MessageId + speedy::Writable<C>,
+    N: NodeId + speedy::Writable<C>,
+{
+    fn write_to<T: ?Sized + speedy::Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        writer.write_value(&self.sender)?;
+        writer.write_value(&self.triggered_by)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -531,7 +565,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                         sender,
                         PlumtreeMsg::Prune(PruneMsg {
                             sender: self.local_id,
-                            triggered_by: id.clone(),
+                            triggered_by: Some(id.clone()),
                         }),
                         PlumPrio::P1,
                     );
@@ -712,6 +746,23 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         if !self.ring_locked.contains(&msg.sender) {
             self.move_to_lazy(&msg.sender, rt);
         }
+    }
+
+    /// Handle a graceful shutdown.
+    ///
+    /// Sends a PRUNE to every eager peer so they stop treating us as part of
+    /// the spanning tree and re-route around us.
+    pub fn handle_shutdown(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        info!(self_actor_id = ?self.local_id, "sending prunes to eager peers due to shutdown");
+        let peers = self.eager_peers.iter().copied().collect::<Vec<_>>();
+        rt.send_all(
+            peers,
+            PlumtreeMsg::Prune(PruneMsg {
+                sender: self.local_id,
+                triggered_by: None,
+            }),
+            PlumPrio::P1,
+        );
     }
 
     /// Originate a new message from this node.
@@ -1532,7 +1583,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: 1,
-                triggered_by: TestMsgId(0),
+                triggered_by: Some(TestMsgId(0)),
             },
             &mut rt,
         );
@@ -1547,7 +1598,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: rand_eager,
-                triggered_by: TestMsgId(0),
+                triggered_by: Some(TestMsgId(0)),
             },
             &mut rt,
         );
@@ -1617,7 +1668,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: prune_sender,
-                triggered_by: TestMsgId(99),
+                triggered_by: Some(TestMsgId(99)),
             },
             &mut rt,
         );
@@ -1630,7 +1681,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: 1,
-                triggered_by: TestMsgId(99),
+                triggered_by: Some(TestMsgId(99)),
             },
             &mut rt,
         );
@@ -1737,7 +1788,7 @@ mod tests {
         assert_eq!(*to, 11);
         let prune = unwrap_prune(m);
         assert_eq!(prune.sender, 0);
-        assert_eq!(prune.triggered_by, TestMsgId(15));
+        assert_eq!(prune.triggered_by, Some(TestMsgId(15)));
 
         assert!(!s.lazy_peers.contains(&11));
         assert!(!s.eager_peers.contains(&11));

@@ -366,13 +366,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
     let send_agent = agent.clone();
     let send_transport = transport.clone();
-    let send_tripwire = tripwire.clone();
-    tokio::spawn(send_messages_loop(
-        send_agent,
-        send_transport,
-        rx_msgs,
-        send_tripwire,
-    ));
+    let send_msgs_handle = tokio::spawn(send_messages_loop(send_agent, send_transport, rx_msgs));
 
     // send out ihave digests to lazy peers
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
@@ -396,7 +390,8 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         let branch = tokio::select! {
             biased;
             _ = &mut tripwire => {
-                info!("plumtree_loop: tripwire fired, shutting down");
+                info!("plumtree_loop: tripwire fired, sending shutdown prunes");
+                state.handle_shutdown(&mut rt);
                 break;
             },
             updates = rx_plumtree_updates.recv() => match updates {
@@ -511,6 +506,11 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             }
         }
     }
+
+    drop(rt);
+    if let Err(e) = send_msgs_handle.await {
+        error!("plumtree send loop task failed to join: {e}");
+    }
 }
 
 #[derive(Debug)]
@@ -528,7 +528,6 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     agent: Agent,
     transport: T,
     mut rx_msgs: CorroReceiver<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
-    mut tripwire: Tripwire,
 ) {
     const MAX_INFLIGHT: usize = 500;
     const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(10);
@@ -574,10 +573,6 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     loop {
         let branch = tokio::select! {
             biased;
-            _ = &mut tripwire => {
-                info!("plumtree send messages loop: tripwire fired, shutting down");
-                break;
-            },
             _ = join_set.join_next(), if !join_set.is_empty() => {
                 continue;
             },

@@ -73,17 +73,20 @@ pub fn bounded<T: Send + 'static>(
     let (tx, rx) = channel(capacity);
 
     let threshold = (capacity as f64 * 0.9) as usize;
-    let inner_channel = tx.clone();
+    // Only hold a *weak* sender for metrics: this task must not keep the channel
+    // open. Once all real senders are dropped, `upgrade()` returns `None`, the
+    // receiver observes the channel as closed, and we stop reporting.
+    let weak_channel = tx.downgrade();
     tokio::spawn(async move {
         let mut ticks_since_report = 0;
         let mut tick = interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut prev = inner_channel.capacity();
+        let mut prev = capacity;
         loop {
             tick.tick().await;
-            if inner_channel.is_closed() {
+            let Some(inner_channel) = weak_channel.upgrade() else {
                 break;
-            }
+            };
             let current = inner_channel.capacity();
             if ticks_since_report >= 30
                 || (prev != current && (current < threshold || prev < threshold))
