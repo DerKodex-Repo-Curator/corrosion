@@ -330,8 +330,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         max_lazy: None,
         prune_threshold: plumtree_config.prune_threshold,
         max_received_entries: 10000,
-        // Suppress repeat PRUNEs to a peer within this window
-        prune_throttle: Some(Duration::from_secs(1)),
+        prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
         eager_ratios: plumtree_config.eager_ratios,
     };
 
@@ -805,7 +804,7 @@ mod tests {
         members::Members,
     };
     use parking_lot::RwLock;
-use plum_foca::EagerRatios;
+    use plum_foca::EagerRatios;
 
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
     // use plum_foca::PlumtreeMsg;

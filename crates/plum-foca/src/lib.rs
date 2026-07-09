@@ -4,11 +4,11 @@ use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
-use thiserror::Error;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
@@ -92,7 +92,9 @@ impl EagerRatios {
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("eager ratios must sum to 100, got near={near_pct}, mid={mid_pct}, far={far_pct} (sum={sum})")]
+#[error(
+    "eager ratios must sum to 100, got near={near_pct}, mid={mid_pct}, far={far_pct} (sum={sum})"
+)]
 pub struct EagerRatiosError {
     pub near_pct: u8,
     pub mid_pct: u8,
@@ -140,7 +142,7 @@ impl Default for Config {
             prune_threshold: 1,
             max_received_entries: 10000,
             max_cached_payloads: 8192,
-            prune_throttle: None,
+            prune_throttle: Some(Duration::from_secs(1)),
             eager_ratios: EagerRatios::default(),
         }
     }

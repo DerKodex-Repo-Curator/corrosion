@@ -230,6 +230,10 @@ pub fn default_plumtree_optimization_threshold() -> u32 {
     7
 }
 
+pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
+    Some(1)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
@@ -238,6 +242,9 @@ pub struct PlumtreeConfig {
     pub optimization_threshold: u32,
     #[serde(default)]
     pub batch_gossip: bool,
+    /// Suppress repeat PRUNEs to the same peer within this window. `None` disables.
+    #[serde(default = "default_plumtree_prune_throttle_secs")]
+    pub prune_throttle_secs: Option<u64>,
     /// Near/Mid/Far split when selecting eager and lazy peers.
     #[serde(default)]
     pub eager_ratios: plum_foca::EagerRatios,
@@ -249,6 +256,7 @@ impl Default for PlumtreeConfig {
             prune_threshold: default_plumtree_prune_threshold(),
             optimization_threshold: default_plumtree_optimization_threshold(),
             batch_gossip: false,
+            prune_throttle_secs: default_plumtree_prune_throttle_secs(),
             eager_ratios: plum_foca::EagerRatios::default(),
         }
     }

@@ -14,7 +14,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -45,6 +45,12 @@ impl SimPayload {
     fn id(&self) -> MId {
         ((self.origin as u64) << 32) | self.seq as u64
     }
+}
+
+/// Decode the origin node encoded in a `SimPayload::id()`/gossip `mid`
+/// (both sims use the same `(origin << 32) | seq` encoding).
+fn origin_of(mid: MId) -> NId {
+    (mid >> 32) as NId
 }
 
 impl Payload for SimPayload {
@@ -240,6 +246,29 @@ enum Event {
         node: NId,
         seq: u32,
     },
+    /// Node stops responding. `restart_after: None` is a permanent crash;
+    /// `Some(d)` means it rejoins after `d` with a fresh `PlumtreeState`,
+    /// like a real process restart.
+    NodeDown {
+        node: NId,
+        restart_after: Option<Duration>,
+    },
+    /// A previously-down node rejoins (only reachable via `NodeDown {
+    /// restart_after: Some(_) }`).
+    NodeUp {
+        node: NId,
+    },
+    /// `observer`'s foca instance finally notices `subject` went down, after
+    /// a random per-observer detection delay.
+    MemberDown {
+        observer: NId,
+        subject: NId,
+    },
+    /// `observer`'s foca instance finally notices `subject` came back.
+    MemberUp {
+        observer: NId,
+        subject: NId,
+    },
 }
 
 struct Scheduled<E> {
@@ -290,6 +319,19 @@ struct Params {
     eager_inflate: usize,
     seed: u64,
     eager_ratios: EagerRatios,
+    /// Number of randomly chosen nodes that crash permanently partway
+    /// through the run (never send or receive again).
+    crash_count: usize,
+    /// Number of randomly chosen nodes that go down and later rejoin with a
+    /// fresh `PlumtreeState`, modeling a real process restart.
+    flap_count: usize,
+    /// How long a flapping node stays down before rejoining.
+    flap_downtime: Duration,
+    /// Range for the random per-observer delay before a `peer_down`/`peer_up`
+    /// is delivered, modeling staggered SWIM failure detection across the
+    /// cluster (real nodes don't all notice a change at the same instant).
+    detection_delay_min: Duration,
+    detection_delay_max: Duration,
 }
 
 impl Params {
@@ -302,15 +344,41 @@ impl Params {
             broadcast_window: Duration::from_millis(n as u64 * 5),
             rtt_aware: true,
             loss: 0.0,
-            prune_throttle: None,
+            prune_throttle: Some(SIM_PRUNE_THROTTLE),
             eager_inflate: 0,
             seed: 42,
             eager_ratios: EagerRatios::default(),
+            crash_count: 0,
+            flap_count: 0,
+            flap_downtime: Duration::from_secs(5),
+            detection_delay_min: Duration::from_secs(2),
+            detection_delay_max: Duration::from_secs(8),
         }
     }
 
     fn with_eager_ratios(mut self, eager_ratios: EagerRatios) -> Self {
         self.eager_ratios = eager_ratios;
+        self
+    }
+
+    /// `crash_count` nodes crash permanently, `flap_count` nodes go down and
+    /// rejoin after `flap_downtime`; all are chosen randomly and scheduled
+    /// uniformly over `broadcast_window`, overlapping the broadcast storm.
+    fn with_failures(
+        mut self,
+        crash_count: usize,
+        flap_count: usize,
+        flap_downtime: Duration,
+    ) -> Self {
+        self.crash_count = crash_count;
+        self.flap_count = flap_count;
+        self.flap_downtime = flap_downtime;
+        self
+    }
+
+    fn with_detection_delay(mut self, min: Duration, max: Duration) -> Self {
+        self.detection_delay_min = min;
+        self.detection_delay_max = max;
         self
     }
 
@@ -337,6 +405,9 @@ impl Params {
 }
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
+/// Default prune throttle in sim: shorter than production (1s) but still
+/// spans a few tick intervals at sim event density.
+const SIM_PRUNE_THROTTLE: Duration = Duration::from_millis(500);
 /// A gossip send crossing a link slower than this counts as long-haul.
 const LONGHAUL_RTT_MS: u64 = 150;
 
@@ -345,6 +416,10 @@ struct MsgStat {
     gossip_sends: u64,
     deliveries: u32,
     last_delivery_at: u64,
+    /// Nodes that have received this message (Plumtree sim only; used to
+    /// check survivor delivery under node failures). Always empty in the
+    /// gossip baseline sim.
+    delivered_to: HashSet<NId>,
 }
 
 #[derive(Default)]
@@ -385,6 +460,17 @@ struct Sim {
     stats: Stats,
     /// avg eager-set size right after bootstrap+inflation, before the run.
     start_avg_eager: f64,
+    /// Nodes currently unreachable (crashed or mid-flap).
+    down: Vec<bool>,
+    /// Nodes that crashed permanently (subset of nodes still `down` once the
+    /// queue fully drains).
+    crashed: HashSet<NId>,
+    /// Nodes that went down and rejoined at least once.
+    flapped: HashSet<NId>,
+    /// Per-node history of `(down_at, up_at)` windows, `up_at == u64::MAX`
+    /// while still down. Used to tell a genuine protocol miss apart from a
+    /// message that could never have reached a recipient that wasn't up yet.
+    downtime_windows: HashMap<NId, Vec<(u64, u64)>>,
 }
 
 impl Sim {
@@ -462,6 +548,10 @@ impl Sim {
             stats: Stats::default(),
             params,
             start_avg_eager: 0.0,
+            down: vec![false; n],
+            crashed: HashSet::new(),
+            flapped: HashSet::new(),
+            downtime_windows: HashMap::new(),
         };
 
         // Optionally over-fill each node's eager set (model admission without
@@ -497,6 +587,39 @@ impl Sim {
             }
         }
 
+        // Inject node failures (crashes and down/up flaps), scheduled
+        // uniformly over the same window so churn overlaps the broadcast
+        // storm, the way a real failure would.
+        let fail_count = sim.params.crash_count + sim.params.flap_count;
+        debug_assert!(
+            fail_count <= n,
+            "not enough nodes for the requested failure counts"
+        );
+        if fail_count > 0 {
+            let mut candidates: Vec<NId> = (0..n as NId).collect();
+            candidates.shuffle(&mut sim.rng);
+            for &node in &candidates[..sim.params.crash_count] {
+                let at = sim.rng.random_range(0..window_us.max(1));
+                sim.push(
+                    at,
+                    Event::NodeDown {
+                        node,
+                        restart_after: None,
+                    },
+                );
+            }
+            for &node in &candidates[sim.params.crash_count..fail_count] {
+                let at = sim.rng.random_range(0..window_us.max(1));
+                sim.push(
+                    at,
+                    Event::NodeDown {
+                        node,
+                        restart_after: Some(sim.params.flap_downtime),
+                    },
+                );
+            }
+        }
+
         sim
     }
 
@@ -517,14 +640,47 @@ impl Sim {
         self.rtt_ms[self.region_of[from as usize] as usize][self.region_of[to as usize] as usize]
     }
 
+    fn rtt_info(&self, from: NId, to: NId) -> RttInfo {
+        if self.params.rtt_aware {
+            RttInfo {
+                ring: ring_from_rtt_ms(self.link_rtt_ms(from, to)),
+            }
+        } else {
+            RttInfo::default()
+        }
+    }
+
+    /// Random per-observer delay before a `peer_down`/`peer_up` is
+    /// delivered, modeling staggered SWIM failure detection.
+    fn random_detection_delay(&mut self) -> u64 {
+        let min = self.params.detection_delay_min.as_micros() as u64;
+        let max = self.params.detection_delay_max.as_micros() as u64;
+        if max <= min {
+            return min;
+        }
+        self.rng.random_range(min..max)
+    }
+
     /// Run until the event queue drains (the protocol quiesces).
     fn run(mut self) -> Report {
+        self.drain_queue_to_quiescence();
+        self.check_invariants();
+        self.report()
+    }
+
+    /// Run the event queue to quiescence. Split out from `run` so failure
+    /// tests can inspect `Sim`'s private state afterward instead of only
+    /// the aggregate `Report`.
+    fn drain_queue_to_quiescence(&mut self) {
         while let Some(Scheduled { at, ev, .. }) = self.queue.pop() {
             debug_assert!(at >= self.now);
             self.now = at;
             self.runtime.now_us = at;
             match ev {
                 Event::Originate { node, seq } => {
+                    if self.down[node as usize] {
+                        continue;
+                    }
                     let payload = SimPayload { origin: node, seq };
                     let id = payload.id();
                     self.msgs.insert(
@@ -534,12 +690,17 @@ impl Sim {
                             gossip_sends: 0,
                             deliveries: 0,
                             last_delivery_at: 0,
+                            delivered_to: HashSet::new(),
                         },
                     );
                     self.states[node as usize].broadcast(id, payload, &mut self.runtime);
                     self.drain(node);
                 }
                 Event::Recv { to, msg } => {
+                    if self.down[to as usize] {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
                     let state = &mut self.states[to as usize];
                     match msg {
                         PlumtreeMsg::Gossip(g) => {
@@ -554,20 +715,119 @@ impl Sim {
                     self.gossip_round = None;
                 }
                 Event::TimerFired { node, timer } => {
+                    if self.down[node as usize] {
+                        continue;
+                    }
                     self.states[node as usize].timer_fired(timer, &mut self.runtime);
                     self.drain(node);
                 }
                 Event::Tick { node } => {
                     self.tick_pending[node as usize] = false;
+                    if self.down[node as usize] {
+                        continue;
+                    }
                     let state = &mut self.states[node as usize];
                     state.cache_evict_if_needed(&mut self.runtime);
                     state.tick(&mut self.runtime);
                     self.drain(node);
                 }
+                Event::NodeDown {
+                    node,
+                    restart_after,
+                } => {
+                    self.down[node as usize] = true;
+                    self.downtime_windows
+                        .entry(node)
+                        .or_default()
+                        .push((self.now, u64::MAX));
+                    if restart_after.is_none() {
+                        self.crashed.insert(node);
+                    }
+                    let n = self.params.n as NId;
+                    for observer in 0..n {
+                        if observer == node || self.down[observer as usize] {
+                            continue;
+                        }
+                        let delay = self.random_detection_delay();
+                        let at = self.now + delay;
+                        self.push(
+                            at,
+                            Event::MemberDown {
+                                observer,
+                                subject: node,
+                            },
+                        );
+                    }
+                    if let Some(downtime) = restart_after {
+                        let at = self.now + downtime.as_micros() as u64;
+                        self.push(at, Event::NodeUp { node });
+                    }
+                }
+                Event::NodeUp { node } => {
+                    self.down[node as usize] = false;
+                    self.flapped.insert(node);
+                    if let Some(windows) = self.downtime_windows.get_mut(&node)
+                        && let Some(w) = windows.iter_mut().rev().find(|w| w.1 == u64::MAX)
+                    {
+                        w.1 = self.now;
+                    }
+                    let config = self.params.config();
+                    let seed = self.rng.random();
+                    self.states[node as usize] = PlumtreeState::new_with_store_seeded(
+                        node,
+                        config.clone(),
+                        SimSeenStore::new(config.max_received_entries),
+                        seed,
+                    );
+                    self.tick_pending[node as usize] = false;
+
+                    // Instant rejoin bootstrap: the restarted node learns the
+                    // current alive membership immediately (like joining
+                    // fresh off the gossip seed addrs).
+                    let n = self.params.n as NId;
+                    let peers: Vec<(NId, RttInfo)> = (0..n)
+                        .filter(|&j| j != node && !self.down[j as usize])
+                        .map(|j| (j, self.rtt_info(node, j)))
+                        .collect();
+                    self.states[node as usize].add_peers_bulk_with_rtt(peers, &mut self.runtime);
+                    self.drain(node);
+
+                    // Every other alive node's foca instance notices the
+                    // rejoin after its own random detection delay.
+                    for observer in 0..n {
+                        if observer == node || self.down[observer as usize] {
+                            continue;
+                        }
+                        let delay = self.random_detection_delay();
+                        let at = self.now + delay;
+                        self.push(
+                            at,
+                            Event::MemberUp {
+                                observer,
+                                subject: node,
+                            },
+                        );
+                    }
+                }
+                Event::MemberDown { observer, subject } => {
+                    if !self.down[observer as usize] {
+                        self.states[observer as usize].peer_down(&subject, &mut self.runtime);
+                        self.drain(observer);
+                    }
+                }
+                Event::MemberUp { observer, subject } => {
+                    if !self.down[observer as usize] && !self.down[subject as usize] {
+                        let info = self.rtt_info(observer, subject);
+                        self.states[observer as usize].peer_up(
+                            subject,
+                            Some(info),
+                            &mut self.runtime,
+                        );
+                        self.drain(observer);
+                    }
+                }
             }
         }
-        self.check_invariants();
-        self.report()
     }
 
     /// Apply everything the node just asked the runtime to do.
@@ -579,6 +839,7 @@ impl Sim {
                 .expect("delivered unknown msg");
             stat.deliveries += 1;
             stat.last_delivery_at = self.now;
+            stat.delivered_to.insert(from);
             self.stats.latencies_us.push(self.now - stat.sent_at);
             // round 0 = received directly from the origin = 1 hop
             let round = self.gossip_round.expect("delivery outside handle_gossip");
@@ -632,7 +893,18 @@ impl Sim {
     }
 
     fn check_invariants(&self) {
-        for state in &self.states {
+        // By the time the queue fully drains, every flap has resolved (its
+        // `NodeUp` always fires eventually), so anything still `down` here
+        // must be a permanent crash.
+        for (i, node) in (0..self.params.n as NId).enumerate() {
+            if self.down[i] {
+                assert!(
+                    self.crashed.contains(&node),
+                    "node {node} still down at drain but not a permanent crash"
+                );
+                continue;
+            }
+            let state = &self.states[i];
             let eager = state.eager_peers();
             let lazy = state.lazy_peers();
             let known = state.known_peers();
@@ -648,7 +920,11 @@ impl Sim {
             }
             assert!(lazy.len() <= state.max_lazy(), "lazy set exceeds max_lazy");
             assert!(state.lazy_queue().is_empty(), "lazy queue not drained");
-            assert_eq!(known.len(), self.params.n - 1, "full membership lost");
+            assert_eq!(
+                known.len(),
+                self.params.n - 1 - self.crashed.len(),
+                "full membership not reconverged for node {node}"
+            );
         }
     }
 
@@ -1077,6 +1353,7 @@ impl GossipSim {
                             gossip_sends: 0,
                             deliveries: 0,
                             last_delivery_at: 0,
+                            delivered_to: HashSet::new(),
                         },
                     );
                     // local broadcast: flood every ring0 peer once (hop 1).
@@ -1505,20 +1782,20 @@ fn sim_2k_rtt_awareness() {
     assert!(aware.longhaul_frac < blind.longhaul_frac);
 }
 
-/// Measure the prune-throttle (B2): same 2k run with throttling off vs a 1s
-/// per-peer PRUNE window. Expect prune traffic to drop sharply with delivery
+/// Measure the prune-throttle (B2): same 2k run with throttling off vs the
+/// sim default (500ms) per-peer PRUNE window. Expect prune traffic to drop
 /// and full-cluster latency preserved (the in-flight duplicate bursts no longer
 /// each draw a PRUNE). Run with:
 ///   cargo test --release -p plum-foca --test sim sim_2k_prune_throttle -- --ignored --nocapture
 #[test]
 #[ignore = "slow; run in release mode"]
 fn sim_2k_prune_throttle() {
-    let baseline = Sim::new(Params::new(2000, 8)).run();
-    let mut throttled_params = Params::new(2000, 8);
-    throttled_params.prune_throttle = Some(Duration::from_secs(1));
-    let throttled = Sim::new(throttled_params).run();
+    let mut baseline_params = Params::new(2000, 8);
+    baseline_params.prune_throttle = None;
+    let baseline = Sim::new(baseline_params).run();
+    let throttled = Sim::new(Params::new(2000, 8)).run();
     println!("prune-throttle OFF:\n{baseline}");
-    println!("prune-throttle 1s:\n{throttled}");
+    println!("prune-throttle 500ms:\n{throttled}");
 
     // delivery must be unharmed
     assert_eq!(
@@ -1541,4 +1818,101 @@ fn sim_2k_prune_throttle() {
         baseline.full_p99_ms,
         throttled.full_p99_ms
     );
+}
+
+/// Some nodes crash permanently mid-run (stop sending/receiving for good).
+/// Observers only learn of the crash after a random per-observer delay
+/// (`MemberDown`), mirroring staggered SWIM detection. The tree must
+/// self-heal around the dead nodes: since the sim always runs to full
+/// quiescence, every node that never crashes must eventually receive every
+/// message, and every surviving node must fully reconverge on membership
+/// (checked by `check_invariants`, which already accounts for `crashed`).
+#[test]
+fn sim_small_crash_resilience() {
+    const N: usize = 200;
+    let params = Params::new(N, 5).with_failures(10, 0, Duration::from_secs(5));
+    let mut sim = Sim::new(params);
+    sim.drain_queue_to_quiescence();
+    sim.check_invariants();
+    let report = sim.report();
+    println!("{report}");
+
+    assert_eq!(sim.crashed.len(), 10, "crash count knob had no effect");
+
+    let survivors: Vec<NId> = (0..N as NId)
+        .filter(|node| !sim.crashed.contains(node))
+        .collect();
+    for (&mid, stat) in sim.msgs.iter() {
+        let origin = origin_of(mid);
+        for &survivor in &survivors {
+            if survivor == origin {
+                continue;
+            }
+            assert!(
+                stat.delivered_to.contains(&survivor),
+                "survivor {survivor} never received message from {origin} \
+                 (crashed nodes: {:?})",
+                sim.crashed
+            );
+        }
+    }
+}
+
+/// Some nodes go down and later rejoin with a fresh `PlumtreeState` (a real
+/// process restart), again with a randomly-delayed `MemberDown`/`MemberUp`
+/// per observer. Plumtree never replays already-delivered messages to a
+/// late (re)joiner, so we can't assert full history delivery — instead, we
+/// wait for every flap + detection delay to resolve, then fire a fresh
+/// broadcast wave and require it reach the *entire* cluster, including the
+/// nodes that just came back.
+#[test]
+fn sim_small_flap_recovery() {
+    const N: usize = 200;
+    let flap_downtime = Duration::from_secs(5);
+    let params = Params::new(N, 5)
+        .with_failures(0, 10, flap_downtime)
+        .with_detection_delay(Duration::from_secs(2), Duration::from_secs(4));
+    let broadcast_window = params.broadcast_window;
+    let detection_delay_max = params.detection_delay_max;
+    let mut sim = Sim::new(params);
+
+    // Worst case: a flap is scheduled right at the end of the window, then
+    // takes `flap_downtime` to come back, then up to `detection_delay_max`
+    // for every observer to notice. Double that last term for margin.
+    let settle_at = broadcast_window.as_micros() as u64
+        + flap_downtime.as_micros() as u64
+        + detection_delay_max.as_micros() as u64 * 2;
+
+    // Post-recovery wave, using `seq: 1` (distinct from the `seq: 0` wave
+    // `Sim::new` already scheduled from the default `msgs_per_node: 1`) so
+    // these message ids don't collide with — and get treated as duplicates
+    // of — the earlier ones.
+    let post_recovery: Vec<MId> = (0..N as NId)
+        .map(|node| {
+            let mid = SimPayload {
+                origin: node,
+                seq: 1,
+            }
+            .id();
+            sim.push(settle_at, Event::Originate { node, seq: 1 });
+            mid
+        })
+        .collect();
+
+    sim.drain_queue_to_quiescence();
+    sim.check_invariants();
+    let report = sim.report();
+    println!("{report}");
+
+    for mid in post_recovery {
+        let stat = &sim.msgs[&mid];
+        assert_eq!(
+            stat.deliveries as usize,
+            N - 1,
+            "message from {} (sent after recovery settled) missed {} of {} recipients",
+            origin_of(mid),
+            (N - 1) - stat.deliveries as usize,
+            N - 1
+        );
+    }
 }
