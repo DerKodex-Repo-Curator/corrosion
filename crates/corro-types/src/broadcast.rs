@@ -109,15 +109,27 @@ pub fn compress_change(change: &ChangeV1, level: i32) -> Result<Vec<u8>, Compres
     Ok(zstd::stream::encode_all(encoded.as_slice(), level)?)
 }
 
-pub fn decompress_change(data: &[u8]) -> Result<ChangeV1, CompressError> {
+pub fn decompress_change(data: &[u8], traffic: &'static str) -> Result<ChangeV1, CompressError> {
     let start = Instant::now();
-    let decompressed = zstd::stream::decode_all(data)?;
+    let decompressed = match zstd::stream::decode_all(data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            counter!("corro.decompression.errors.total", "traffic" => traffic).increment(1);
+            return Err(e.into());
+        }
+    };
     histogram!("corro.decompression.time.seconds").record(start.elapsed());
     if decompressed.len() > data.len() {
         counter!("corro.decompression.bytes.extra")
             .increment((decompressed.len() - data.len()) as u64);
     }
-    Ok(ChangeV1::read_from_buffer(&decompressed)?)
+    match ChangeV1::read_from_buffer(&decompressed) {
+        Ok(change) => Ok(change),
+        Err(e) => {
+            counter!("corro.decompression.errors.total", "traffic" => traffic).increment(1);
+            Err(e.into())
+        }
+    }
 }
 
 /// Result of attempting to compress a change for the wire.
@@ -197,14 +209,7 @@ impl BroadcastV1 {
     pub fn into_change(&self) -> Result<ChangeV1, BroadcastDecodeError> {
         match self {
             BroadcastV1::Change(change) => Ok(change.clone()),
-            BroadcastV1::CompressedChange(data) => match decompress_change(data) {
-                Ok(change) => Ok(change),
-                Err(e) => {
-                    counter!("corro.decompression.errors.total", "traffic" => "broadcast")
-                        .increment(1);
-                    Err(e.into())
-                }
-            },
+            BroadcastV1::CompressedChange(data) => decompress_change(data, "broadcast").map_err(Into::into),
         }
     }
 }

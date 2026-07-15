@@ -365,14 +365,7 @@ impl SyncMessage {
         let msg = Self::from_slice(buf)?;
         Ok(match msg {
             SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => {
-                match decompress_change(&data) {
-                    Ok(change) => SyncMessage::V1(SyncMessageV1::Changeset(change)),
-                    Err(e) => {
-                        counter!("corro.decompression.errors.total", "traffic" => "sync")
-                            .increment(1);
-                        return Err(e.into());
-                    }
-                }
+                SyncMessage::V1(SyncMessageV1::Changeset(decompress_change(&data, "sync")?))
             }
             other => other,
         })

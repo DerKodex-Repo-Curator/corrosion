@@ -18,7 +18,9 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::CrsqlDbVersion,
+    base::{CrsqlDbVersion, CrsqlSeq},
+    broadcast::{ChangeV1, Changeset, Timestamp},
+    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::{default_admin_path, AuthzConfig, Config, ConfigError, LogFormat, OtelConfig},
     sqlite::CrConn,
 };
@@ -28,6 +30,7 @@ use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
+use speedy::Writable;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
@@ -562,6 +565,65 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             info!("Exited with code: {:?}", exit.code());
             std::process::exit(exit.code().unwrap_or(1));
         }
+        Command::Db(DbCommand::SampleChanges { out, limit }) => {
+            let db_path = cli.db_path()?;
+            let conn = CrConn::init(Connection::open(&db_path)?)?;
+
+            std::fs::create_dir_all(out)?;
+
+            let mut version_stmt = conn.prepare(
+                "SELECT site_id, db_version
+                    FROM crsql_changes
+                    GROUP BY site_id, db_version
+                    ORDER BY MAX(ts) DESC
+                    LIMIT ?",
+            )?;
+
+            let versions: Vec<(ActorId, CrsqlDbVersion)> = version_stmt
+                .query_map([*limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+
+            let mut written = 0usize;
+            for (actor_id, version) in versions {
+                let (last_seq, ts): (CrsqlSeq, Timestamp) = conn.query_row(
+                    "SELECT MAX(seq), MAX(ts)
+                         FROM crsql_changes
+                         WHERE site_id = ? AND db_version = ?",
+                    (actor_id, version),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+
+                let mut change_stmt = conn.prepare(
+                    r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                           FROM crsql_changes
+                           WHERE site_id = ? AND db_version = ?
+                           ORDER BY seq ASC"#,
+                )?;
+                let rows = change_stmt.query_map((actor_id, version), row_to_change)?;
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+
+                for (i, chunk) in chunked.enumerate() {
+                    let (changes, seqs) = chunk?;
+                    let change = ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::FullV2 {
+                            actor_id,
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    };
+                    let encoded = change.write_to_vec()?;
+                    std::fs::write(out.join(format!("{actor_id}_{version}_{i}.bin")), &encoded)?;
+                    written += 1;
+                }
+            }
+
+            info!("wrote {written} change samples to {out}");
+        }
         Command::Subs(SubsCommand::Info { hash, id }) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::Info {
@@ -850,6 +912,17 @@ enum TlsClientCommand {
 enum DbCommand {
     /// Acquires the lock on the DB
     Lock { cmd: String },
+    /// Write recent changes to disk as speedy-encoded `ChangeV1` samples,
+    /// one file per change chunk, for training a zstd compression
+    /// dictionary with `db train-dict`
+    SampleChanges {
+        /// Directory to write samples into
+        #[arg(long)]
+        out: Utf8PathBuf,
+        /// How many of the most recent db_versions to sample
+        #[arg(long, default_value = "5000")]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand)]
