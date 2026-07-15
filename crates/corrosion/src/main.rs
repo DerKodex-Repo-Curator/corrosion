@@ -572,9 +572,8 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             std::fs::create_dir_all(out)?;
 
             let mut version_stmt = conn.prepare(
-                "SELECT site_id, db_version
+                "SELECT DISTINCT site_id, db_version
                     FROM crsql_changes
-                    GROUP BY site_id, db_version
                     ORDER BY MAX(ts) DESC
                     LIMIT ?",
             )?;

@@ -209,7 +209,9 @@ impl BroadcastV1 {
     pub fn into_change(&self) -> Result<ChangeV1, BroadcastDecodeError> {
         match self {
             BroadcastV1::Change(change) => Ok(change.clone()),
-            BroadcastV1::CompressedChange(data) => decompress_change(data, "broadcast").map_err(Into::into),
+            BroadcastV1::CompressedChange(data) => {
+                decompress_change(data, "broadcast").map_err(Into::into)
+            }
         }
     }
 }
