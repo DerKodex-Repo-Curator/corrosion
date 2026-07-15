@@ -232,8 +232,14 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
-    #[serde(flatten)]
-    pub compression: CompressionConfig,
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+}
+
+impl GossipConfig {
+    pub fn compression_config(&self) -> CompressionConfig {
+        self.compression.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,15 +247,14 @@ pub struct CompressionConfig {
     /// Whether to zstd-compress broadcast and sync changeset payloads.
     /// Safe to flip cluster-wide at any time: uncompressed and compressed
     /// nodes interoperate
-    #[serde(rename = "compression", default)]
+    #[serde(default)]
     pub enabled: bool,
     /// zstd compression level for wire payloads (1–22). Ignored when
     /// `enabled` is false.
-    #[serde(rename = "compression_level", default = "default_compression_level")]
+    #[serde(default = "default_compression_level")]
     pub level: i32,
-    /// Path to a trained zstd dictionary (e.g. produced by `corrosion db
-    /// train-dict`) to use for broadcast compression. Optional
-    #[serde(rename = "compression_dict_path", default)]
+    /// Path to a trained zstd dictionary
+    #[serde(default)]
     pub dict_path: Option<Utf8PathBuf>,
 }
 
@@ -429,9 +434,10 @@ impl Config {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
         }
-        if !(1..=22).contains(&self.gossip.compression.level) {
+        let compression_level = self.gossip.compression_config().level;
+        if !(1..=22).contains(&compression_level) {
             return Err(ConfigError::InvalidCompressionLevel {
-                value: self.gossip.compression.level,
+                value: compression_level,
             });
         }
         Ok(())
@@ -597,13 +603,13 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
-                compression: CompressionConfig {
+                compression: Some(CompressionConfig {
                     enabled: self.compression.unwrap_or_default(),
                     level: self
                         .compression_level
                         .unwrap_or_else(default_compression_level),
                     dict_path: None,
-                },
+                }),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

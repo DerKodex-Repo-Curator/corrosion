@@ -170,14 +170,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
-    let change_dict = match &conf.gossip.compression.dict_path {
+    let compression_config = conf.gossip.compression_config();
+    let change_dict = match &compression_config.dict_path {
         Some(path) => {
             let bytes = std::fs::read(path)
                 .map_err(|e| eyre::eyre!("could not read compression dict at {path}: {e}"))?;
-            Some(Arc::new(ZstdDict::new(
-                &bytes,
-                conf.gossip.compression.level,
-            )))
+            Some(Arc::new(ZstdDict::new(&bytes, compression_config.level)))
         }
         None => None,
     };

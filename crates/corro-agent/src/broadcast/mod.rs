@@ -543,8 +543,9 @@ async fn handle_broadcasts(
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
                 // compress payload if needed
-                let bcast = if agent.config().gossip.compression.enabled && !bcast.is_compressed() {
-                    let level = agent.config().gossip.compression.level;
+                let compression_config = agent.config().gossip.compression_config();
+                let bcast = if compression_config.enabled && !bcast.is_compressed() {
+                    let level = compression_config.level;
                     let dict = agent.change_dict();
                     match tokio::task::spawn_blocking(move || {
                         bcast.compress_for_wire(level, dict.as_deref())
