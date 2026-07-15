@@ -29,7 +29,7 @@ use once_cell::sync::OnceCell;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk as os;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use speedy::Writable;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
@@ -567,11 +567,17 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         }
         Command::Db(DbCommand::SampleChanges { out, limit }) => {
             let db_path = cli.db_path()?;
-            let conn = CrConn::init(Connection::open(&db_path)?)?;
+            let mut conn = CrConn::init(Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?)?;
 
             std::fs::create_dir_all(out)?;
+            let tx = conn.transaction()?;
 
-            let mut version_stmt = conn.prepare(
+            let mut version_stmt = tx.prepare(
                 "SELECT DISTINCT site_id, db_version
                     FROM crsql_changes
                     ORDER BY ts DESC
@@ -584,7 +590,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
             let mut written = 0usize;
             for (actor_id, version) in versions {
-                let (last_seq, ts): (CrsqlSeq, Timestamp) = conn.query_row(
+                let (last_seq, ts): (CrsqlSeq, Timestamp) = tx.query_row(
                     "SELECT MAX(seq), MAX(ts)
                          FROM crsql_changes
                          WHERE site_id = ? AND db_version = ?",
@@ -592,7 +598,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
 
-                let mut change_stmt = conn.prepare(
+                let mut change_stmt = tx.prepare(
                     r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                            FROM crsql_changes
                            WHERE site_id = ? AND db_version = ?
