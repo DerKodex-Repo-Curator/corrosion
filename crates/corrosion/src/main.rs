@@ -574,7 +574,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             let mut version_stmt = conn.prepare(
                 "SELECT DISTINCT site_id, db_version
                     FROM crsql_changes
-                    ORDER BY MAX(ts) DESC
+                    ORDER BY ts DESC
                     LIMIT ?",
             )?;
 
