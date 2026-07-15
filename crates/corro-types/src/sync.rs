@@ -364,9 +364,9 @@ impl SyncMessage {
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
         let msg = Self::from_slice(buf)?;
         Ok(match msg {
-            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => {
-                SyncMessage::V1(SyncMessageV1::Changeset(decompress_change(&data, "sync")?))
-            }
+            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => SyncMessage::V1(
+                SyncMessageV1::Changeset(decompress_change(&data, "sync", None)?),
+            ),
             other => other,
         })
     }
@@ -380,7 +380,7 @@ impl SyncMessage {
             return self;
         };
 
-        match try_compress_change_for_wire(&change, "sync", level) {
+        match try_compress_change_for_wire(&change, "sync", level, None) {
             Ok(WireCompression::Compressed(compressed)) => {
                 SyncMessage::V1(SyncMessageV1::CompressedChangeset(compressed))
             }

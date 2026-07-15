@@ -232,16 +232,35 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    #[serde(flatten)]
+    pub compression: CompressionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
     /// Whether to zstd-compress broadcast and sync changeset payloads.
     /// Safe to flip cluster-wide at any time: uncompressed and compressed
-    /// nodes interoperate (broadcast drops what it can't decode and heals
-    /// via sync; sync negotiates per-peer via a capability flag).
-    #[serde(default)]
-    pub compression: bool,
+    /// nodes interoperate
+    #[serde(rename = "compression", default)]
+    pub enabled: bool,
     /// zstd compression level for wire payloads (1–22). Ignored when
-    /// `compression` is false.
-    #[serde(default = "default_compression_level")]
-    pub compression_level: i32,
+    /// `enabled` is false.
+    #[serde(rename = "compression_level", default = "default_compression_level")]
+    pub level: i32,
+    /// Path to a trained zstd dictionary (e.g. produced by `corrosion db
+    /// train-dict`) to use for broadcast compression. Optional
+    #[serde(rename = "compression_dict_path", default)]
+    pub dict_path: Option<Utf8PathBuf>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: default_compression_level(),
+            dict_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,9 +429,9 @@ impl Config {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
         }
-        if !(1..=22).contains(&self.gossip.compression_level) {
+        if !(1..=22).contains(&self.gossip.compression.level) {
             return Err(ConfigError::InvalidCompressionLevel {
-                value: self.gossip.compression_level,
+                value: self.gossip.compression.level,
             });
         }
         Ok(())
@@ -578,10 +597,13 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
-                compression: self.compression.unwrap_or_default(),
-                compression_level: self
-                    .compression_level
-                    .unwrap_or_else(default_compression_level),
+                compression: CompressionConfig {
+                    enabled: self.compression.unwrap_or_default(),
+                    level: self
+                        .compression_level
+                        .unwrap_or_else(default_compression_level),
+                    dict_path: None,
+                },
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

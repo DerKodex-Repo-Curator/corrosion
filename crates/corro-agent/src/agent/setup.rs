@@ -33,7 +33,7 @@ use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, ZstdDict},
     channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
@@ -170,6 +170,18 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
+    let change_dict = match &conf.gossip.compression.dict_path {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| eyre::eyre!("could not read compression dict at {path}: {e}"))?;
+            Some(Arc::new(ZstdDict::new(
+                &bytes,
+                conf.gossip.compression.level,
+            )))
+        }
+        None => None,
+    };
+
     let opts = AgentOptions {
         gossip_server_endpoint,
         transport: transport.clone(),
@@ -202,6 +214,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_clear_buf,
         tx_changes,
         tx_foca,
+        change_dict,
         write_sema,
         schema: RwLock::new(schema),
         cluster_id,
