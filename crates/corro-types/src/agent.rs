@@ -33,10 +33,9 @@ use tripwire::Tripwire;
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
-    broadcast::{
-        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp, ZstdDict,
-    },
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
+    compress::ZstdDicts,
     config::Config,
     metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
@@ -75,7 +74,7 @@ pub struct AgentConfig {
     pub tx_foca: CorroSender<FocaInput>,
 
     /// Trained zstd dictionary for broadcast compression, if configured.
-    pub change_dict: Option<Arc<ZstdDict>>,
+    pub change_dict: Option<Arc<ZstdDicts>>,
 
     pub write_sema: Arc<Semaphore>,
 
@@ -111,7 +110,7 @@ pub struct AgentInner {
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
-    change_dict: Option<Arc<ZstdDict>>,
+    change_dict: Option<Arc<ZstdDicts>>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
@@ -219,7 +218,7 @@ impl Agent {
         &self.0.tx_foca
     }
 
-    pub fn change_dict(&self) -> Option<Arc<ZstdDict>> {
+    pub fn change_dict(&self) -> Option<Arc<ZstdDicts>> {
         self.0.change_dict.clone()
     }
 

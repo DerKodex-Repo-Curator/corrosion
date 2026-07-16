@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use corro_types::{
     actor::ClusterId,
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1, ZstdDict},
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
     channel::CorroSender,
+    compress::ZstdDicts,
 };
 use metrics::counter;
 use speedy::Readable;
@@ -19,7 +20,7 @@ pub fn spawn_unipayload_handler(
     conn: &quinn::Connection,
     cluster_id: ClusterId,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    change_dict: Option<Arc<ZstdDict>>,
+    change_dict: Option<Arc<ZstdDicts>>,
 ) {
     tokio::spawn({
         let conn = conn.clone();

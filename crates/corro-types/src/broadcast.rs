@@ -2,19 +2,22 @@ use std::{
     cmp,
     collections::HashMap,
     fmt,
-    io::{self, Read, Write},
+    io,
     num::{NonZeroU32, ParseIntError},
     ops::Deref,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use crate::compress::{
+    decompress_change, try_compress_change_for_wire, CompressError, WireCompression, ZstdDicts,
+};
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{ColumnName, SqliteValue, TableName};
 use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
-use metrics::{counter, histogram};
+use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -97,132 +100,6 @@ pub enum AuthzV1 {
     Token(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CompressError {
-    #[error(transparent)]
-    Speedy(#[from] speedy::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
-/// A trained zstd dictionary, prepared for both compression and
-/// decompression. Only ever used for broadcast traffic.
-pub struct ZstdDict {
-    encoder: zstd::dict::EncoderDictionary<'static>,
-    decoder: zstd::dict::DecoderDictionary<'static>,
-}
-
-impl ZstdDict {
-    pub fn new(bytes: &[u8], level: i32) -> Self {
-        Self {
-            encoder: zstd::dict::EncoderDictionary::copy(bytes, level),
-            decoder: zstd::dict::DecoderDictionary::copy(bytes),
-        }
-    }
-}
-
-fn encode_all_with_dict(data: &[u8], level: i32, dict: Option<&ZstdDict>) -> io::Result<Vec<u8>> {
-    match dict {
-        Some(dict) => {
-            let mut buf = Vec::new();
-            let mut encoder =
-                zstd::stream::write::Encoder::with_prepared_dictionary(&mut buf, &dict.encoder)?;
-            encoder.write_all(data)?;
-            encoder.finish()?;
-            Ok(buf)
-        }
-        None => zstd::stream::encode_all(data, level),
-    }
-}
-
-fn decode_all_with_dict(data: &[u8], dict: Option<&ZstdDict>) -> io::Result<Vec<u8>> {
-    match dict {
-        Some(dict) => {
-            let mut decoder =
-                zstd::stream::read::Decoder::with_prepared_dictionary(data, &dict.decoder)?;
-            let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf)?;
-            Ok(buf)
-        }
-        None => zstd::stream::decode_all(data),
-    }
-}
-
-pub fn compress_change(
-    change: &ChangeV1,
-    level: i32,
-    dict: Option<&ZstdDict>,
-) -> Result<Vec<u8>, CompressError> {
-    let encoded = change.write_to_vec()?;
-    Ok(encode_all_with_dict(&encoded, level, dict)?)
-}
-
-pub fn decompress_change(
-    data: &[u8],
-    traffic: &'static str,
-    dict: Option<&ZstdDict>,
-) -> Result<ChangeV1, CompressError> {
-    let start = Instant::now();
-    let decompressed = match decode_all_with_dict(data, dict) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            counter!("corro.decompression.errors.total", "traffic" => traffic).increment(1);
-            return Err(e.into());
-        }
-    };
-    histogram!("corro.decompression.time.seconds").record(start.elapsed());
-    if decompressed.len() > data.len() {
-        counter!("corro.decompression.bytes.extra")
-            .increment((decompressed.len() - data.len()) as u64);
-    }
-    match ChangeV1::read_from_buffer(&decompressed) {
-        Ok(change) => Ok(change),
-        Err(e) => {
-            counter!("corro.decompression.errors.total", "traffic" => traffic).increment(1);
-            Err(e.into())
-        }
-    }
-}
-
-/// Result of attempting to compress a change for the wire.
-pub enum WireCompression {
-    /// Payload shrank; send the compressed bytes.
-    Compressed(Vec<u8>),
-    /// Compression didn't help; send the original change.
-    Uncompressed,
-}
-
-/// Try to compress a `ChangeV1` for the wire. Records compression metrics under
-/// `traffic` (`"broadcast"` or `"sync"`).
-pub fn try_compress_change_for_wire(
-    change: &ChangeV1,
-    traffic: &'static str,
-    level: i32,
-    dict: Option<&ZstdDict>,
-) -> Result<WireCompression, CompressError> {
-    let raw_len = change.write_to_vec()?.len();
-
-    let start = Instant::now();
-    counter!("corro.compression.attempts.total", "traffic" => traffic).increment(1);
-    counter!("corro.compression.bytes.raw.total", "traffic" => traffic).increment(raw_len as u64);
-
-    match compress_change(change, level, dict)? {
-        compressed if compressed.len() < raw_len => {
-            let saved_bytes = raw_len - compressed.len();
-
-            histogram!("corro.compression.time.seconds").record(start.elapsed());
-            counter!("corro.compression.used.total", "traffic" => traffic).increment(1);
-            counter!("corro.compression.bytes.saved", "traffic" => traffic)
-                .increment(saved_bytes as u64);
-            Ok(WireCompression::Compressed(compressed))
-        }
-        _ => {
-            counter!("corro.compression.useless", "traffic" => traffic).increment(raw_len as u64);
-            Ok(WireCompression::Uncompressed)
-        }
-    }
-}
-
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
@@ -238,12 +115,12 @@ impl BroadcastV1 {
     /// Try to compress the inner `ChangeV1` for the wire. Falls back to the
     /// original, uncompressed variant if compression fails or doesn't
     /// actually shrink the payload.
-    pub fn compress_for_wire(self, level: i32, dict: Option<&ZstdDict>) -> Self {
+    pub fn compress_for_wire(self, level: i32, dicts: Option<&ZstdDicts>) -> Self {
         let BroadcastV1::Change(change) = self else {
             return self;
         };
 
-        match try_compress_change_for_wire(&change, "broadcast", level, dict) {
+        match try_compress_change_for_wire(&change, "broadcast", level, dicts) {
             Ok(WireCompression::Compressed(compressed)) => {
                 BroadcastV1::CompressedChange(compressed)
             }
@@ -259,11 +136,11 @@ impl BroadcastV1 {
     /// Decode the inner `ChangeV1`, borrowing `self` so the original wire
     /// form (compressed or not) can still be reused verbatim -- e.g. to
     /// rebroadcast it to other peers without re-deciding/re-compressing.
-    pub fn into_change(&self, dict: Option<&ZstdDict>) -> Result<ChangeV1, BroadcastDecodeError> {
+    pub fn into_change(&self, dicts: Option<&ZstdDicts>) -> Result<ChangeV1, BroadcastDecodeError> {
         match self {
             BroadcastV1::Change(change) => Ok(change.clone()),
             BroadcastV1::CompressedChange(data) => {
-                decompress_change(data, "broadcast", dict).map_err(Into::into)
+                decompress_change(data, "broadcast", dicts).map_err(Into::into)
             }
         }
     }
@@ -985,20 +862,79 @@ mod tests {
         assert_eq!(decoded, change);
     }
 
+    fn trained_dict_bytes() -> Vec<u8> {
+        let samples: Vec<Vec<u8>> = (1..200)
+            .map(|n| change_with_rows(n).write_to_vec().unwrap())
+            .collect();
+        zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+    }
+
     #[test]
     fn test_compress_change_with_dict_roundtrips() {
         let change = change_with_rows(50);
-        let encoded = change.write_to_vec().unwrap();
-        let dict = ZstdDict::new(&encoded, 3);
+        let dicts = ZstdDicts::new(&trained_dict_bytes(), 3, vec![]);
 
-        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&dict));
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&dicts));
         let BroadcastV1::CompressedChange(compressed) = bcast else {
             panic!("expected change to compress with a dict");
         };
 
         let decoded = BroadcastV1::CompressedChange(compressed)
-            .into_change(Some(&dict))
+            .into_change(Some(&dicts))
             .unwrap();
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn test_decode_with_older_dict_via_directory_scan() {
+        // Simulate a rotation: encode with the "old" dict, but the decoder
+        // was configured with a "new" primary dict and only knows the old
+        // one via its extra (directory-scanned) dictionaries.
+        let old_dict_bytes = trained_dict_bytes();
+        let new_dict_bytes = {
+            let samples: Vec<Vec<u8>> = (200..400)
+                .map(|n| change_with_rows(n).write_to_vec().unwrap())
+                .collect();
+            zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+        };
+
+        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![old_dict_bytes]);
+
+        let change = change_with_rows(50);
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected change to compress with a dict");
+        };
+
+        let decoded = BroadcastV1::CompressedChange(compressed)
+            .into_change(Some(&decoder_dicts))
+            .unwrap();
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn test_decode_fails_for_unknown_dict_id() {
+        let old_dict_bytes = trained_dict_bytes();
+        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
+        // decoder doesn't know about `old_dict_bytes` at all
+        let new_dict_bytes = {
+            let samples: Vec<Vec<u8>> = (200..400)
+                .map(|n| change_with_rows(n).write_to_vec().unwrap())
+                .collect();
+            zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+        };
+        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![]);
+
+        let change = change_with_rows(50);
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected change to compress with a dict");
+        };
+
+        let err = BroadcastV1::CompressedChange(compressed)
+            .into_change(Some(&decoder_dicts))
+            .unwrap_err();
+        assert!(matches!(err, BroadcastDecodeError::Compress(_)));
     }
 }

@@ -5,7 +5,12 @@ use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io::{self, Read, Seek, SeekFrom},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -15,8 +20,9 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
+use zstd;
 
 // Internals
 use crate::{
@@ -33,7 +39,8 @@ use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, ZstdDict},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    compress::ZstdDicts,
     channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
@@ -175,7 +182,41 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         Some(path) => {
             let bytes = std::fs::read(path)
                 .map_err(|e| eyre::eyre!("could not read compression dict at {path}: {e}"))?;
-            Some(Arc::new(ZstdDict::new(&bytes, compression_config.level)))
+
+            // also pick up any other trained dictionaries in the same directory
+            let mut extra_dicts = Vec::new();
+            if let Some(dir) = path.parent().filter(|dir| !dir.as_str().is_empty()) {
+                let entries = std::fs::read_dir(dir)
+                    .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() || entry.path() == path.as_std_path() {
+                        continue;
+                    }
+                    let entry_path = entry.path();
+
+                    let mut file = match std::fs::File::open(&entry_path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            warn!("could not open candidate compression dict {entry_path:?}: {e}");
+                            continue;
+                        }
+                    };
+
+                    match load_dictionary(&mut file) {
+                        Ok(Some(b)) => extra_dicts.push(b),
+                        _ => {
+                            warn!("could not read candidate compression dict {entry_path:?}");
+                        }
+                    }
+                }
+            }
+
+            Some(Arc::new(ZstdDicts::new(
+                &bytes,
+                compression_config.level,
+                extra_dicts,
+            )))
         }
         None => None,
     };
@@ -285,4 +326,18 @@ async fn setup_spawn_subscriptions(
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
+}
+
+fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; 4];
+    let peeked = file.read(&mut prefix)?;
+    let is_dict = peeked == 4
+        && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
+    if !is_dict {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }

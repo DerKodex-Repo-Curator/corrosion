@@ -13,10 +13,8 @@ use crate::{
     actor::ActorId,
     agent::Bookie,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{
-        decompress_change, try_compress_change_for_wire, ChangeV1, CompressError, Timestamp,
-        WireCompression,
-    },
+    broadcast::{ChangeV1, Timestamp},
+    compress::{decompress_change, try_compress_change_for_wire, CompressError, WireCompression},
 };
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]

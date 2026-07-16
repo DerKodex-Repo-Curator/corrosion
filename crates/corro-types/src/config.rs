@@ -253,7 +253,13 @@ pub struct CompressionConfig {
     /// `enabled` is false.
     #[serde(default = "default_compression_level")]
     pub level: i32,
-    /// Path to a trained zstd dictionary
+    /// Path to a trained zstd dictionary (e.g. produced by `corrosion db
+    /// train-dict`), used to compress outgoing broadcasts. Its containing
+    /// directory is also scanned at startup for other trained dictionaries
+    /// (e.g. previous versions of it), which are loaded and indexed by
+    /// their embedded zstd dictionary id purely for decoding -- so
+    /// broadcasts from peers that haven't rotated to the current dictionary
+    /// yet can still be decoded.
     #[serde(default)]
     pub dict_path: Option<Utf8PathBuf>,
 }
