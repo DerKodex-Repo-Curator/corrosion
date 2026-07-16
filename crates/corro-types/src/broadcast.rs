@@ -1,8 +1,7 @@
 use std::{
     cmp,
     collections::HashMap,
-    fmt,
-    io,
+    fmt, io,
     num::{NonZeroU32, ParseIntError},
     ops::Deref,
     time::Duration,

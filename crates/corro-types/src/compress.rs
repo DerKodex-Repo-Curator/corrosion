@@ -210,7 +210,8 @@ mod tests {
     use crate::{
         actor::ActorId,
         base::{CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastDecodeError, BroadcastV1, Change, Changeset, Timestamp},
+        broadcast::{BroadcastDecodeError, BroadcastV1, Changeset, Timestamp},
+        change::Change,
     };
     use corro_api_types::SqliteValue;
     use corro_base_types::CrsqlSeqRange;

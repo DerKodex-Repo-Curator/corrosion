@@ -40,8 +40,8 @@ use corro_types::{
     agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
-    compress::ZstdDicts,
     channel::{bounded, CorroReceiver},
+    compress::ZstdDicts,
     config::Config,
     members::Members,
     metrics_tracker::MetricsTracker,
@@ -331,8 +331,7 @@ async fn setup_spawn_subscriptions(
 fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
     let mut prefix = [0u8; 4];
     let peeked = file.read(&mut prefix)?;
-    let is_dict = peeked == 4
-        && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
+    let is_dict = peeked == 4 && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
     if !is_dict {
         return Ok(None);
     }
